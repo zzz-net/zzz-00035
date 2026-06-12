@@ -1,0 +1,11 @@
+export:
+  default_encoding: utf-8-sig
+thresholds:
+  breakpoint_interval_minutes: 10
+  continuous_over_temp_minutes: 5
+  merge_window_minutes: 30
+  temperature_upper_limit: -15.0
+validation:
+  allow_missing_box_id: true
+  reject_duplicate_batch: true
+  skip_invalid_timestamp_rows: true

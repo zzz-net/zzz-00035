@@ -1,0 +1,23 @@
+[
+  {
+    "carrier": "顺丰冷链",
+    "alert_time": "2025-06-10 08:18:00",
+    "box_id": "BX-001",
+    "alert_type": "temperature_exceeded",
+    "message": "BX-001 温度超过阈值，当前 -12.3°C"
+  },
+  {
+    "carrier": "京东冷链",
+    "alert_time": "2025-06-10 11:12:00",
+    "box_id": "BX-004",
+    "alert_type": "temperature_exceeded",
+    "message": "BX-004 持续升温，当前 -10.0°C"
+  },
+  {
+    "carrier": "京东冷链",
+    "alert_time": "2025-06-10 11:22:00",
+    "box_id": "BX-004",
+    "alert_type": "equipment_fault",
+    "message": "BX-004 冷机疑似故障，温度 -6.0°C"
+  }
+]

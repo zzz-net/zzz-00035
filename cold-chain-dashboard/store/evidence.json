@@ -1,0 +1,191 @@
+[
+  {
+    "evidence_id": "0f6b86b33f0f",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:10:00",
+    "detail": "温度 -14.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "3257a88d5f43",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:15:00",
+    "detail": "温度 -12.3°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "e7648910c95e",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:20:00",
+    "detail": "温度 -11.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "cd91f1d7c035",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:25:00",
+    "detail": "温度 -10.5°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "0c8dd42af345",
+    "event_id": "d9d24fa08b83",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-002",
+    "timestamp": "2025-06-10 09:10:00",
+    "detail": "温度 -14.8°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "f892d946c11c",
+    "event_id": "d9d24fa08b83",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-002",
+    "timestamp": "2025-06-10 09:15:00",
+    "detail": "温度 -13.1°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "b56c75a9f075",
+    "event_id": "d9d24fa08b83",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-002",
+    "timestamp": "2025-06-10 09:20:00",
+    "detail": "温度 -14.5°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "a12a5f6e4eb7",
+    "event_id": "6fb77c0eb5d6",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "UNKNOWN",
+    "timestamp": "2025-06-10 10:15:00",
+    "detail": "温度 -13.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "3ef7f68d75d3",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:00:00",
+    "detail": "温度 -14.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "eaaf114018c3",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:05:00",
+    "detail": "温度 -12.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "01ca0b411e9b",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:10:00",
+    "detail": "温度 -10.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "838bf4b7cff5",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:15:00",
+    "detail": "温度 -8.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "9742780daac8",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:20:00",
+    "detail": "温度 -6.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "72cb7c8a74d1",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:25:00",
+    "detail": "温度 -5.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "4a3a05cb4e7a",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "温度记录",
+    "source_file": "sample_temperature.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:30:00",
+    "detail": "温度 -13.0°C 超过上限 -15.0°C"
+  },
+  {
+    "evidence_id": "2289eb6b4346",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "收货备注",
+    "source_file": "sample_receipt_notes.csv",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:02:00",
+    "detail": "收货人: 张三, 备注: 外观正常"
+  },
+  {
+    "evidence_id": "995f344d6130",
+    "event_id": "d9d24fa08b83",
+    "evidence_type": "收货备注",
+    "source_file": "sample_receipt_notes.csv",
+    "box_id": "BX-002",
+    "timestamp": "2025-06-10 09:03:00",
+    "detail": "收货人: 李四, 备注: 封条完好"
+  },
+  {
+    "evidence_id": "ed9c0c3fbf85",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "收货备注",
+    "source_file": "sample_receipt_notes.csv",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:02:00",
+    "detail": "收货人: 赵六, 备注: 温度计显示偏高"
+  },
+  {
+    "evidence_id": "56ea1770cffe",
+    "event_id": "447af2d4afb9",
+    "evidence_type": "承运商告警",
+    "source_file": "sample_carrier_alerts.json",
+    "box_id": "BX-001",
+    "timestamp": "2025-06-10 08:18:00",
+    "detail": "承运商: 顺丰冷链, 类型: temperature_exceeded, 信息: BX-001 温度超过阈值，当前 -12.3°C"
+  },
+  {
+    "evidence_id": "4930a85cb7bd",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "承运商告警",
+    "source_file": "sample_carrier_alerts.json",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:12:00",
+    "detail": "承运商: 京东冷链, 类型: temperature_exceeded, 信息: BX-004 持续升温，当前 -10.0°C"
+  },
+  {
+    "evidence_id": "437fa46b400c",
+    "event_id": "46bef8baa1c3",
+    "evidence_type": "承运商告警",
+    "source_file": "sample_carrier_alerts.json",
+    "box_id": "BX-004",
+    "timestamp": "2025-06-10 11:22:00",
+    "detail": "承运商: 京东冷链, 类型: equipment_fault, 信息: BX-004 冷机疑似故障，温度 -6.0°C"
+  }
+]

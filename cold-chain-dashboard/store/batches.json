@@ -1,0 +1,11 @@
+[
+  {
+    "batch_id": "test-batch-1",
+    "import_time": "2026-06-13 07:09:03",
+    "file_name": "sample_temperature.csv",
+    "file_hash": "9a47896a2640e7566c832b3d96858ae46356e434dff205f9c7b3b27fbd6b9720",
+    "row_count": 27,
+    "skipped_rows": 1,
+    "status": "成功"
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "log_id": "b43f51ce1bd0",
+    "event_id": "447af2d4afb9",
+    "action": "状态变更: 待处理 -> 已确认",
+    "operator": "reviewer_zhang",
+    "remark": "经核查属实，确认为异常",
+    "timestamp": "2026-06-13 07:09:24"
+  },
+  {
+    "log_id": "5d22b914213b",
+    "event_id": "447af2d4afb9",
+    "action": "状态变更: 已确认 -> 已关闭",
+    "operator": "reviewer_zhang",
+    "remark": "已通知承运商整改",
+    "timestamp": "2026-06-13 07:09:24"
+  }
+]
