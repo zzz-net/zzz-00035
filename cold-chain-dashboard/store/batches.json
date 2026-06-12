@@ -1,11 +1,26 @@
 [
   {
-    "batch_id": "test-batch-1",
-    "import_time": "2026-06-13 07:09:03",
-    "file_name": "sample_temperature.csv",
-    "file_hash": "9a47896a2640e7566c832b3d96858ae46356e434dff205f9c7b3b27fbd6b9720",
-    "row_count": 27,
-    "skipped_rows": 1,
-    "status": "成功"
+    "batch_id": "batch1",
+    "import_time": "2026-06-13 07:36:47",
+    "file_name": "test.csv",
+    "file_hash": "a63840a25dc8d528760d3974f4fb88856ef38e81d6f2f04206bdf4e3a0c6f91a",
+    "raw_data_hash": "22ad8dcfd1c162de5e0ba575e3d17321a0d406d240d2c4ebb6694fa26e3d7486",
+    "config_signature": "d6fb692639ab873d",
+    "row_count": 12,
+    "skipped_rows": 2,
+    "status": "ok",
+    "is_reanalysis": false
+  },
+  {
+    "batch_id": "batch2",
+    "import_time": "2026-06-13 07:36:47",
+    "file_name": "test.csv",
+    "file_hash": "a63840a25dc8d528760d3974f4fb88856ef38e81d6f2f04206bdf4e3a0c6f91a",
+    "raw_data_hash": "22ad8dcfd1c162de5e0ba575e3d17321a0d406d240d2c4ebb6694fa26e3d7486",
+    "config_signature": "7bd6fa1398048f5c",
+    "row_count": 12,
+    "skipped_rows": 2,
+    "status": "ok",
+    "is_reanalysis": true
   }
 ]

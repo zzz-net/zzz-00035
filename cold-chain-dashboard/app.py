@@ -9,8 +9,11 @@ import streamlit as st
 import yaml
 
 from core.analyzer import (
+    compute_config_hash,
     compute_file_hash,
+    compute_raw_data_hash,
     generate_events,
+    InvalidTimestampError,
     link_alert_evidence,
     link_receipt_evidence,
     parse_carrier_alerts,
@@ -18,17 +21,21 @@ from core.analyzer import (
     parse_temperature_csv,
     validate_temperature_rows,
 )
-from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch
+from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch, SkippedRowLog
 from core.persistence import (
     add_events,
     add_evidence_only,
+    find_batch_by_raw_data_hash,
     get_audit_logs_for_event,
     get_evidence_for_event,
+    get_skipped_logs_for_batch,
+    is_exact_duplicate_batch,
     is_duplicate_batch,
     load_audit_logs,
     load_batches,
     load_events,
     update_event,
+    update_events_for_reanalysis,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -82,27 +89,55 @@ if menu == "数据导入":
             try:
                 temp_content = temp_file.read()
                 file_hash = compute_file_hash(temp_content)
-                if is_duplicate_batch(file_hash):
-                    st.error("⚠️ 该文件已导入过，重复导入同一批数据会被拒绝以保护旧数据。")
-                    st.stop()
 
                 temp_df = parse_temperature_csv(temp_content)
-                valid_rows, skipped = validate_temperature_rows(temp_df, cfg)
                 batch_id = ImportBatch().batch_id
+
+                try:
+                    valid_rows, skipped_logs = validate_temperature_rows(
+                        temp_df, cfg, batch_id=batch_id
+                    )
+                except InvalidTimestampError as e:
+                    st.error(f"❌ 导入失败: {e}")
+                    if e.details:
+                        with st.expander("查看错误详情", expanded=True):
+                            st.json(e.details)
+                    st.stop()
+
+                skipped = len(skipped_logs)
+                raw_data_hash = compute_raw_data_hash(valid_rows)
+                config_signature = compute_config_hash(cfg)
+
+                if is_exact_duplicate_batch(raw_data_hash, config_signature):
+                    st.error(
+                        "⚠️ 该文件已在当前阈值配置下导入过，完全重复的导入被拒绝。"
+                        "如需重新分析，请调整阈值后再次导入。"
+                    )
+                    st.stop()
+
+                existing_batch = find_batch_by_raw_data_hash(raw_data_hash)
+                is_reanalysis = existing_batch is not None
+
                 batch = ImportBatch(
                     batch_id=batch_id,
                     file_name=temp_file.name,
                     file_hash=file_hash,
+                    raw_data_hash=raw_data_hash,
+                    config_signature=config_signature,
                     row_count=len(temp_df),
                     skipped_rows=skipped,
                     status="成功" if valid_rows else "无有效数据",
+                    is_reanalysis=is_reanalysis,
                 )
 
-                events, evidences = generate_events(valid_rows, cfg, batch_id, temp_file.name)
+                events, evidences = generate_events(
+                    valid_rows, cfg, batch_id, temp_file.name,
+                    raw_data_hash=raw_data_hash, config_signature=config_signature
+                )
                 receipt_evidence = []
                 alert_evidence = []
 
-                if receipt_file:
+                if receipt_file and not is_reanalysis:
                     try:
                         receipt_content = receipt_file.read()
                         receipt_df = parse_receipt_csv(receipt_content)
@@ -112,7 +147,7 @@ if menu == "数据导入":
                     except Exception as e:
                         st.warning(f"收货备注解析失败: {e}")
 
-                if alert_file:
+                if alert_file and not is_reanalysis:
                     try:
                         alert_content = alert_file.read()
                         alerts = parse_carrier_alerts(alert_content)
@@ -122,22 +157,43 @@ if menu == "数据导入":
                     except Exception as e:
                         st.warning(f"承运商告警解析失败: {e}")
 
-                if events:
-                    add_events(events, evidences + receipt_evidence + alert_evidence, batch)
+                if is_reanalysis:
+                    updated, new_count, unchanged = update_events_for_reanalysis(
+                        events, evidences, batch, skipped_logs
+                    )
                     st.success(
-                        f"导入完成: 生成 {len(events)} 条异常事件, "
-                        f"{len(evidences) + len(receipt_evidence) + len(alert_evidence)} 条证据, "
-                        f"跳过 {skipped} 行无效数据"
+                        f"🔄 重新分析完成: 更新 {updated} 个事件, 新增 {new_count} 个事件, "
+                        f"其他 {unchanged} 个事件保持不变。\n\n"
+                        f"原始复核状态、处理人、处理备注、关闭时间和审计日志已全部保留。"
                     )
                 else:
-                    add_events([], [], batch)
-                    st.info(f"导入完成但未发现异常事件 (跳过 {skipped} 行无效数据)")
+                    if events:
+                        add_events(events, evidences + receipt_evidence + alert_evidence, batch, skipped_logs)
+                        st.success(
+                            f"✅ 导入完成: 生成 {len(events)} 条异常事件, "
+                            f"{len(evidences) + len(receipt_evidence) + len(alert_evidence)} 条证据, "
+                            f"跳过 {skipped} 行无效数据"
+                        )
+                    else:
+                        add_events([], [], batch, skipped_logs)
+                        st.info(f"✅ 导入完成但未发现异常事件 (跳过 {skipped} 行无效数据)")
 
                 if skipped > 0:
-                    st.warning(f"⚠️ 跳过了 {skipped} 行无效数据（缺箱号/时间解析失败/温度无效）")
+                    with st.expander(f"⚠️ 查看 {skipped} 条跳过行的详细记录", expanded=False):
+                        skip_df = pd.DataFrame([
+                            {
+                                "行号": l.row_number,
+                                "箱号": l.box_id,
+                                "原始时间戳": l.timestamp_raw,
+                                "原始温度": l.temperature_raw,
+                                "跳过原因": l.reason,
+                            }
+                            for l in skipped_logs
+                        ])
+                        st.dataframe(skip_df, use_container_width=True, hide_index=True)
 
             except Exception as e:
-                st.error(f"导入失败: {e}")
+                st.error(f"❌ 导入失败: {e}")
 
 
 elif menu == "异常事件看板":
@@ -343,5 +399,39 @@ elif menu == "导入历史":
     if not batches:
         st.info("暂无导入记录")
     else:
-        df = pd.DataFrame([b.to_dict() for b in batches])
+        rows = []
+        for b in batches:
+            rows.append({
+                "导入时间": b.import_time,
+                "批次ID": b.batch_id,
+                "文件名": b.file_name,
+                "总行数": b.row_count,
+                "跳过行数": b.skipped_rows,
+                "状态": b.status,
+                "是否重分析": "是" if b.is_reanalysis else "否",
+                "配置签名": b.config_signature[:8] if b.config_signature else "",
+            })
+        df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+        selected_batch = st.selectbox(
+            "选择批次查看跳过行日志",
+            options=[""] + [b.batch_id for b in batches if b.skipped_rows > 0],
+            format_func=lambda x: "请选择" if not x else x,
+        )
+        if selected_batch:
+            skipped = get_skipped_logs_for_batch(selected_batch)
+            if skipped:
+                skip_df = pd.DataFrame([
+                    {
+                        "行号": l.row_number,
+                        "箱号": l.box_id,
+                        "原始时间戳": l.timestamp_raw,
+                        "原始温度": l.temperature_raw,
+                        "跳过原因": l.reason,
+                    }
+                    for l in skipped
+                ])
+                st.dataframe(skip_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("该批次无跳过行记录")

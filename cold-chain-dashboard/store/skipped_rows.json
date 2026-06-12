@@ -1,0 +1,42 @@
+[
+  {
+    "log_id": "4a7dd4f96069",
+    "batch_id": "t1",
+    "row_number": 12,
+    "reason": "时间戳解析失败: bad-timestamp",
+    "box_id": "bad-row",
+    "timestamp_raw": "bad-timestamp",
+    "temperature_raw": "-17.0",
+    "created_at": "2026-06-13 07:36:47"
+  },
+  {
+    "log_id": "f02eb777bc52",
+    "batch_id": "t1",
+    "row_number": 13,
+    "reason": "温度值无法解析: bad-temp",
+    "box_id": "BX-005",
+    "timestamp_raw": "2025-06-10 10:10:00",
+    "temperature_raw": "bad-temp",
+    "created_at": "2026-06-13 07:36:47"
+  },
+  {
+    "log_id": "255e35a1d0a2",
+    "batch_id": "batch2",
+    "row_number": 12,
+    "reason": "时间戳解析失败: bad-timestamp",
+    "box_id": "bad-row",
+    "timestamp_raw": "bad-timestamp",
+    "temperature_raw": "-17.0",
+    "created_at": "2026-06-13 07:36:47"
+  },
+  {
+    "log_id": "8f46b1077304",
+    "batch_id": "batch2",
+    "row_number": 13,
+    "reason": "温度值无法解析: bad-temp",
+    "box_id": "BX-005",
+    "timestamp_raw": "2025-06-10 10:10:00",
+    "temperature_raw": "bad-temp",
+    "created_at": "2026-06-13 07:36:47"
+  }
+]

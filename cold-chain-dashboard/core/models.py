@@ -58,6 +58,9 @@ class AnomalyEvent:
     handler_remark: str = ""
     close_time: str = ""
     batch_id: str = ""
+    raw_data_hash: str = ""
+    config_signature: str = ""
+    event_signature: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     evidence_ids: list = field(default_factory=list)
 
@@ -71,9 +74,27 @@ class ImportBatch:
     import_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     file_name: str = ""
     file_hash: str = ""
+    raw_data_hash: str = ""
+    config_signature: str = ""
     row_count: int = 0
     skipped_rows: int = 0
     status: str = ""
+    is_reanalysis: bool = False
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class SkippedRowLog:
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    batch_id: str = ""
+    row_number: int = 0
+    reason: str = ""
+    box_id: str = ""
+    timestamp_raw: str = ""
+    temperature_raw: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def to_dict(self):
         return asdict(self)

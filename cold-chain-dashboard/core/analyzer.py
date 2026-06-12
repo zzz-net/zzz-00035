@@ -7,11 +7,35 @@ import pandas as pd
 
 from .models import (
     AnomalyEvent, Evidence, EvidenceType, ImportBatch, EventStatus,
+    SkippedRowLog,
 )
 
 
 def compute_file_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def compute_config_hash(config: dict) -> str:
+    thresholds = config.get("thresholds", {})
+    key = (
+        float(thresholds.get("temperature_upper_limit", 0)),
+        int(thresholds.get("continuous_over_temp_minutes", 0)),
+        int(thresholds.get("breakpoint_interval_minutes", 0)),
+        int(thresholds.get("merge_window_minutes", 0)),
+    )
+    return hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+
+
+def compute_raw_data_hash(valid_rows: list) -> str:
+    keys = []
+    for r in sorted(valid_rows, key=lambda x: (x["box_id"], x["timestamp"].isoformat())):
+        keys.append(f"{r['box_id']}|{r['timestamp'].isoformat()}|{r['temperature_c']}")
+    return hashlib.sha256("\n".join(keys).encode()).hexdigest()
+
+
+def compute_event_signature(box_id: str, start_time: str, end_time: str, temp_limit: float) -> str:
+    key = f"{box_id}|{start_time}|{end_time}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def parse_temperature_csv(content: bytes) -> pd.DataFrame:
@@ -42,37 +66,84 @@ def parse_carrier_alerts(content: bytes) -> list:
     return data
 
 
-def validate_temperature_rows(df: pd.DataFrame, config: dict) -> tuple:
+class InvalidTimestampError(Exception):
+    def __init__(self, message: str, details: dict = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def validate_temperature_rows(df: pd.DataFrame, config: dict, batch_id: str = "") -> tuple:
     valid_rows = []
-    skipped = 0
+    skipped_logs: list[SkippedRowLog] = []
     allow_missing = config.get("validation", {}).get("allow_missing_box_id", True)
     skip_bad_ts = config.get("validation", {}).get("skip_invalid_timestamp_rows", True)
 
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
+        row_number = int(idx) + 2
         box_id = str(row.get("box_id", "")).strip()
         ts_raw = str(row.get("timestamp", "")).strip()
         temp_raw = str(row.get("temperature_c", "")).strip()
 
         if not box_id or box_id == "nan":
             if not allow_missing:
-                skipped += 1
+                skipped_logs.append(SkippedRowLog(
+                    batch_id=batch_id,
+                    row_number=row_number,
+                    reason="缺箱号",
+                    box_id="",
+                    timestamp_raw=ts_raw,
+                    temperature_raw=temp_raw,
+                ))
                 continue
+
         if not temp_raw or temp_raw == "nan":
-            skipped += 1
+            skipped_logs.append(SkippedRowLog(
+                batch_id=batch_id,
+                row_number=row_number,
+                reason="温度值为空",
+                box_id=box_id,
+                timestamp_raw=ts_raw,
+                temperature_raw=temp_raw,
+            ))
             continue
+
         try:
             temperature = float(temp_raw)
         except ValueError:
-            skipped += 1
+            skipped_logs.append(SkippedRowLog(
+                batch_id=batch_id,
+                row_number=row_number,
+                reason=f"温度值无法解析: {temp_raw}",
+                box_id=box_id,
+                timestamp_raw=ts_raw,
+                temperature_raw=temp_raw,
+            ))
             continue
+
+        ts = None
         try:
             ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
         except (ValueError, TypeError):
-            if skip_bad_ts:
-                skipped += 1
-                continue
+            if not skip_bad_ts:
+                raise InvalidTimestampError(
+                    f"第 {row_number} 行时间戳解析失败: '{ts_raw}'，格式应为 YYYY-MM-DD HH:MM:SS。"
+                    f"请修正数据或将 skip_invalid_timestamp_rows 设为 true 以跳过该行。",
+                    details={
+                        "row_number": row_number,
+                        "box_id": box_id,
+                        "timestamp_raw": ts_raw,
+                        "temperature_raw": temp_raw,
+                    }
+                )
             else:
-                skipped += 1
+                skipped_logs.append(SkippedRowLog(
+                    batch_id=batch_id,
+                    row_number=row_number,
+                    reason=f"时间戳解析失败: {ts_raw}",
+                    box_id=box_id,
+                    timestamp_raw=ts_raw,
+                    temperature_raw=temp_raw,
+                ))
                 continue
 
         valid_rows.append({
@@ -82,7 +153,7 @@ def validate_temperature_rows(df: pd.DataFrame, config: dict) -> tuple:
             "timestamp_raw": ts_raw,
         })
 
-    return valid_rows, skipped
+    return valid_rows, skipped_logs
 
 
 def generate_events(
@@ -90,11 +161,18 @@ def generate_events(
     config: dict,
     batch_id: str,
     source_file: str,
+    raw_data_hash: str = "",
+    config_signature: str = "",
 ) -> tuple:
     temp_limit = config["thresholds"]["temperature_upper_limit"]
     cont_min = config["thresholds"]["continuous_over_temp_minutes"]
     bp_min = config["thresholds"]["breakpoint_interval_minutes"]
     merge_min = config["thresholds"]["merge_window_minutes"]
+
+    if not raw_data_hash:
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+    if not config_signature:
+        config_signature = compute_config_hash(config)
 
     by_box: dict[str, list] = {}
     for r in valid_rows:
@@ -135,13 +213,19 @@ def generate_events(
                 if len(seg) == 1:
                     duration = 0
                 max_temp = max(r["temperature_c"] for r in seg)
+                start_time = seg[0]["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+                end_time = seg[-1]["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+                event_sig = compute_event_signature(box_id, start_time, end_time, temp_limit)
                 ev = AnomalyEvent(
                     box_id=box_id,
-                    start_time=seg[0]["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-                    end_time=seg[-1]["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                    start_time=start_time,
+                    end_time=end_time,
                     max_temperature=round(max_temp, 2),
                     duration_minutes=int(duration),
                     batch_id=batch_id,
+                    raw_data_hash=raw_data_hash,
+                    config_signature=config_signature,
+                    event_signature=event_sig,
                 )
                 ev_ids = []
                 for r in seg:

@@ -19,10 +19,11 @@ cold-chain-dashboard/
 ├── app.py                    # Streamlit 主应用
 ├── config.yaml               # 阈值与校验配置
 ├── requirements.txt          # Python 依赖
+├── test_regression.py        # 回归测试套件（13个测试）
 ├── core/
-│   ├── models.py             # 数据模型（事件、证据、审计日志、导入批次）
+│   ├── models.py             # 数据模型（事件、证据、审计日志、导入批次、跳过行）
 │   ├── analyzer.py           # 温度解析、事件生成、证据关联
-│   └── persistence.py        # JSON 文件持久化（线程安全）
+│   └── persistence.py        # JSON 文件持久化（线程安全、重分析逻辑）
 ├── data/
 │   ├── sample_temperature.csv
 │   ├── sample_receipt_notes.csv
@@ -31,7 +32,8 @@ cold-chain-dashboard/
     ├── events.json
     ├── evidence.json
     ├── audit_log.json
-    └── batches.json
+    ├── batches.json
+    └── skipped_rows.json     # 跳过行日志（新增）
 ```
 
 ## 配置说明 (config.yaml)

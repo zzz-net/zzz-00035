@@ -1,87 +1,38 @@
 [
   {
-    "event_id": "447af2d4afb9",
+    "event_id": "e76cc97917ee",
     "box_id": "BX-001",
-    "start_time": "2025-06-10 08:10:00",
-    "end_time": "2025-06-10 08:25:00",
-    "max_temperature": -10.5,
+    "start_time": "2025-06-10 08:05:00",
+    "end_time": "2025-06-10 08:20:00",
+    "max_temperature": -11.0,
     "duration_minutes": 15,
-    "status": "已关闭",
-    "handler": "reviewer_zhang",
-    "handler_remark": "已通知承运商整改",
-    "close_time": "2026-06-13 07:09:24",
-    "batch_id": "test-batch-1",
-    "created_at": "2026-06-13 07:09:03",
-    "evidence_ids": [
-      "0f6b86b33f0f",
-      "3257a88d5f43",
-      "e7648910c95e",
-      "cd91f1d7c035",
-      "2289eb6b4346",
-      "56ea1770cffe"
-    ]
+    "status": "已确认",
+    "handler": "reviwer",
+    "handler_remark": "confirmed",
+    "close_time": "",
+    "batch_id": "batch2",
+    "raw_data_hash": "22ad8dcfd1c162de5e0ba575e3d17321a0d406d240d2c4ebb6694fa26e3d7486",
+    "config_signature": "7bd6fa1398048f5c",
+    "event_signature": "d909aa563dcb9c68",
+    "created_at": "2026-06-13 07:36:47",
+    "evidence_ids": []
   },
   {
-    "event_id": "d9d24fa08b83",
+    "event_id": "5a73f17a0b9c",
     "box_id": "BX-002",
-    "start_time": "2025-06-10 09:10:00",
+    "start_time": "2025-06-10 09:00:00",
     "end_time": "2025-06-10 09:20:00",
     "max_temperature": -13.1,
-    "duration_minutes": 10,
+    "duration_minutes": 20,
     "status": "待处理",
     "handler": "",
     "handler_remark": "",
     "close_time": "",
-    "batch_id": "test-batch-1",
-    "created_at": "2026-06-13 07:09:03",
-    "evidence_ids": [
-      "0c8dd42af345",
-      "f892d946c11c",
-      "b56c75a9f075",
-      "995f344d6130"
-    ]
-  },
-  {
-    "event_id": "6fb77c0eb5d6",
-    "box_id": "UNKNOWN",
-    "start_time": "2025-06-10 10:15:00",
-    "end_time": "2025-06-10 10:15:00",
-    "max_temperature": -13.0,
-    "duration_minutes": 0,
-    "status": "待处理",
-    "handler": "",
-    "handler_remark": "",
-    "close_time": "",
-    "batch_id": "test-batch-1",
-    "created_at": "2026-06-13 07:09:03",
-    "evidence_ids": [
-      "a12a5f6e4eb7"
-    ]
-  },
-  {
-    "event_id": "46bef8baa1c3",
-    "box_id": "BX-004",
-    "start_time": "2025-06-10 11:00:00",
-    "end_time": "2025-06-10 11:30:00",
-    "max_temperature": -5.0,
-    "duration_minutes": 30,
-    "status": "待处理",
-    "handler": "",
-    "handler_remark": "",
-    "close_time": "",
-    "batch_id": "test-batch-1",
-    "created_at": "2026-06-13 07:09:03",
-    "evidence_ids": [
-      "3ef7f68d75d3",
-      "eaaf114018c3",
-      "01ca0b411e9b",
-      "838bf4b7cff5",
-      "9742780daac8",
-      "72cb7c8a74d1",
-      "4a3a05cb4e7a",
-      "ed9c0c3fbf85",
-      "4930a85cb7bd",
-      "437fa46b400c"
-    ]
+    "batch_id": "batch2",
+    "raw_data_hash": "22ad8dcfd1c162de5e0ba575e3d17321a0d406d240d2c4ebb6694fa26e3d7486",
+    "config_signature": "7bd6fa1398048f5c",
+    "event_signature": "025d58fc40c34d46",
+    "created_at": "2026-06-13 07:36:47",
+    "evidence_ids": []
   }
 ]
