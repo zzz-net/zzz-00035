@@ -12,6 +12,13 @@ class EventStatus(str, Enum):
     CLOSED = "已关闭"
 
 
+class Priority(str, Enum):
+    LOW = "低"
+    MEDIUM = "中"
+    HIGH = "高"
+    URGENT = "紧急"
+
+
 class EvidenceType(str, Enum):
     TEMPERATURE_RECORD = "温度记录"
     RECEIPT_NOTE = "收货备注"
@@ -39,6 +46,9 @@ class AuditLog:
     action: str = ""
     operator: str = ""
     remark: str = ""
+    field_changed: str = ""
+    old_value: str = ""
+    new_value: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def to_dict(self):
@@ -57,6 +67,11 @@ class AnomalyEvent:
     handler: str = ""
     handler_remark: str = ""
     close_time: str = ""
+    assignee: str = ""
+    deadline: str = ""
+    priority: str = Priority.MEDIUM.value
+    last_updated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    version: int = 1
     batch_id: str = ""
     raw_data_hash: str = ""
     config_signature: str = ""

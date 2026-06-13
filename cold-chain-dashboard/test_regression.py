@@ -24,12 +24,13 @@ from core.analyzer import (
     parse_temperature_csv,
     validate_temperature_rows,
 )
-from core.models import AnomalyEvent, EventStatus, ImportBatch, SkippedRowLog
+from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch, Priority, SkippedRowLog
 from core.persistence import (
     add_events,
     clear_all_for_test,
     get_audit_logs_for_event,
     get_evidence_for_event,
+    get_event_by_id,
     get_events_by_raw_data_hash,
     get_skipped_logs_for_batch,
     is_exact_duplicate_batch,
@@ -38,10 +39,13 @@ from core.persistence import (
     load_events,
     load_evidence,
     load_skipped_logs,
+    save_audit_logs,
     save_batches,
     save_events,
     update_event,
+    update_event_assignment,
     update_events_for_reanalysis,
+    VersionConflictError,
 )
 
 
@@ -269,8 +273,9 @@ class TestReimportAndReanalysis(TestBase):
         )
 
         old_audit = get_audit_logs_for_event(event_to_review.event_id)
-        self.assertEqual(len(old_audit), 1)
-        self.assertEqual(old_audit[0].operator, "测试员")
+        self.assertGreaterEqual(len(old_audit), 2)
+        operators = [l.operator for l in old_audit]
+        self.assertIn("测试员", operators)
 
         old_evidence_before = get_evidence_for_event(event_to_review.event_id)
         old_evidence_count = len(load_evidence())
@@ -329,8 +334,10 @@ class TestReimportAndReanalysis(TestBase):
 
         audit_after = get_audit_logs_for_event(event_to_review.event_id)
         self.assertEqual(len(audit_after), len(old_audit))
-        self.assertEqual(audit_after[0].operator, "测试员")
-        self.assertEqual(audit_after[0].remark, "确认超温")
+        operators_after = [l.operator for l in audit_after]
+        self.assertIn("测试员", operators_after)
+        remarks_after = [l.remark for l in audit_after]
+        self.assertIn("确认超温", remarks_after)
 
         evidence_after = get_evidence_for_event(event_to_review.event_id)
         after_non_temp_ids = [
@@ -346,7 +353,8 @@ class TestReimportAndReanalysis(TestBase):
         for old_id in old_temp_evidence_ids:
             self.assertNotIn(old_id, new_temp_evidence_ids)
 
-        self.assertEqual(len(load_audit_logs()), len(old_audit) + (1 if event_2.event_id != event_to_review.event_id else 0))
+        old_audit_count = len(load_audit_logs())
+        self.assertEqual(old_audit_count, len(audit_after) + len(get_audit_logs_for_event(event_2.event_id)))
 
     def test_reanalysis_does_not_duplicate_evidence(self):
         """Re-analysis should not duplicate non-temperature evidence."""
@@ -588,6 +596,581 @@ class TestMissingBoxId(TestBase):
 
         skipped_reasons = [l.reason for l in skipped_logs]
         self.assertTrue(any("缺箱号" in r for r in skipped_reasons))
+
+
+class TestDefaultConfigAndMigration(TestBase):
+    """Test default configuration and data migration for old stores."""
+
+    def test_new_event_has_default_values(self):
+        """Newly created events should have correct default values for new fields."""
+        event = AnomalyEvent(box_id="BX-TEST", start_time="2025-06-10 08:00:00", end_time="2025-06-10 09:00:00")
+        self.assertEqual(event.assignee, "")
+        self.assertEqual(event.deadline, "")
+        self.assertEqual(event.priority, Priority.MEDIUM.value)
+        self.assertEqual(event.version, 1)
+        self.assertIsNotNone(event.last_updated_at)
+
+    def test_old_event_data_migration(self):
+        """Old event data without new fields should be migrated with default values."""
+        old_event_data = {
+            "event_id": "test-old-001",
+            "box_id": "BX-OLD",
+            "start_time": "2025-06-10 08:00:00",
+            "end_time": "2025-06-10 09:00:00",
+            "max_temperature": -10.0,
+            "duration_minutes": 60,
+            "status": EventStatus.PENDING.value,
+            "handler": "",
+            "handler_remark": "",
+            "close_time": "",
+            "batch_id": "batch-old",
+            "raw_data_hash": "oldhash",
+            "config_signature": "oldsig",
+            "event_signature": "oldeventsig",
+            "created_at": "2025-06-10 10:00:00",
+            "evidence_ids": [],
+        }
+
+        from core.persistence import _migrate_event_data
+        migrated = _migrate_event_data(old_event_data.copy())
+
+        self.assertEqual(migrated["assignee"], "")
+        self.assertEqual(migrated["deadline"], "")
+        self.assertEqual(migrated["priority"], Priority.MEDIUM.value)
+        self.assertEqual(migrated["version"], 1)
+        self.assertEqual(migrated["last_updated_at"], "2025-06-10 10:00:00")
+
+        for key in old_event_data:
+            self.assertEqual(migrated[key], old_event_data[key])
+
+    def test_old_audit_log_migration(self):
+        """Old audit log data without new fields should be migrated with default values."""
+        old_log_data = {
+            "log_id": "log-old-001",
+            "event_id": "test-old-001",
+            "action": "状态变更: 待处理 -> 已确认",
+            "operator": "测试员",
+            "remark": "确认超温",
+            "timestamp": "2025-06-10 11:00:00",
+        }
+
+        from core.persistence import _migrate_audit_log_data
+        migrated = _migrate_audit_log_data(old_log_data.copy())
+
+        self.assertEqual(migrated["field_changed"], "")
+        self.assertEqual(migrated["old_value"], "")
+        self.assertEqual(migrated["new_value"], "")
+
+        for key in old_log_data:
+            self.assertEqual(migrated[key], old_log_data[key])
+
+    def test_migrated_data_persists_and_reloads(self):
+        """Migrated data should be saved correctly and reload with new fields intact."""
+        old_event_data = {
+            "event_id": "test-migrate-001",
+            "box_id": "BX-MIG",
+            "start_time": "2025-06-10 08:00:00",
+            "end_time": "2025-06-10 09:00:00",
+            "max_temperature": -10.0,
+            "duration_minutes": 60,
+            "status": EventStatus.PENDING.value,
+            "handler": "",
+            "handler_remark": "",
+            "close_time": "",
+            "batch_id": "batch-mig",
+            "raw_data_hash": "mighash",
+            "config_signature": "migsig",
+            "event_signature": "migeventsig",
+            "created_at": "2025-06-10 10:00:00",
+            "evidence_ids": [],
+        }
+
+        import json
+        from core.persistence import _EVENTS_FILE, _ensure_dir
+        _ensure_dir()
+        with open(_EVENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump([old_event_data], f, ensure_ascii=False, indent=2)
+
+        loaded = load_events()
+        self.assertEqual(len(loaded), 1)
+        ev = loaded[0]
+        self.assertEqual(ev.event_id, "test-migrate-001")
+        self.assertEqual(ev.assignee, "")
+        self.assertEqual(ev.deadline, "")
+        self.assertEqual(ev.priority, Priority.MEDIUM.value)
+        self.assertEqual(ev.version, 1)
+        self.assertEqual(ev.last_updated_at, "2025-06-10 10:00:00")
+
+        save_events(loaded)
+
+        reloaded = load_events()
+        self.assertEqual(len(reloaded), 1)
+        ev2 = reloaded[0]
+        self.assertEqual(ev2.event_id, "test-migrate-001")
+        self.assertEqual(ev2.assignee, "")
+        self.assertEqual(ev2.priority, Priority.MEDIUM.value)
+
+    def test_config_has_default_assignees(self):
+        """Config should have default assignees and priority settings."""
+        import yaml
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        self.assertIn("assignment", cfg)
+        self.assertEqual(cfg["assignment"]["default_priority"], "中")
+        self.assertGreater(len(cfg["assignment"]["default_assignees"]), 0)
+        self.assertIn("早班A", cfg["assignment"]["default_assignees"])
+
+
+class TestAssignmentAndAuditLog(TestBase):
+    """Test event assignment, audit logging, and version tracking."""
+
+    def _create_test_event(self):
+        """Helper to create and save a test event."""
+        event = AnomalyEvent(
+            box_id="BX-TEST-001",
+            start_time="2025-06-10 08:00:00",
+            end_time="2025-06-10 09:00:00",
+            max_temperature=-10.0,
+            duration_minutes=60,
+        )
+        save_events([event])
+        return event
+
+    def test_update_event_assignment(self):
+        """Event assignment (assignee, deadline, priority) should be saved correctly."""
+        event = self._create_test_event()
+        deadline = "2025-06-11 18:00:00"
+
+        success, updated = update_event_assignment(
+            event.event_id,
+            assignee="早班A",
+            deadline=deadline,
+            priority=Priority.HIGH.value,
+            operator="主管",
+            remark="紧急处理",
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(updated.assignee, "早班A")
+        self.assertEqual(updated.deadline, deadline)
+        self.assertEqual(updated.priority, Priority.HIGH.value)
+        self.assertEqual(updated.version, 2)
+
+        reloaded = get_event_by_id(event.event_id)
+        self.assertEqual(reloaded.assignee, "早班A")
+        self.assertEqual(reloaded.deadline, deadline)
+        self.assertEqual(reloaded.priority, Priority.HIGH.value)
+        self.assertEqual(reloaded.version, 2)
+
+    def test_assignment_audit_logs(self):
+        """Assignment changes should create detailed audit logs with old/new values."""
+        event = self._create_test_event()
+
+        update_event_assignment(
+            event.event_id,
+            assignee="早班A",
+            deadline="2025-06-11 18:00:00",
+            priority=Priority.HIGH.value,
+            operator="主管",
+            remark="紧急处理",
+        )
+
+        logs = get_audit_logs_for_event(event.event_id)
+        self.assertGreaterEqual(len(logs), 3)
+
+        log_actions = [l.action for l in logs]
+        self.assertTrue(any("责任人分派" in a for a in log_actions))
+        self.assertTrue(any("截止时间变更" in a for a in log_actions))
+        self.assertTrue(any("优先级变更" in a for a in log_actions))
+
+        assignee_log = next(l for l in logs if l.field_changed == "assignee")
+        self.assertEqual(assignee_log.old_value, "")
+        self.assertEqual(assignee_log.new_value, "早班A")
+        self.assertEqual(assignee_log.operator, "主管")
+        self.assertEqual(assignee_log.remark, "紧急处理")
+
+        priority_log = next(l for l in logs if l.field_changed == "priority")
+        self.assertEqual(priority_log.old_value, Priority.MEDIUM.value)
+        self.assertEqual(priority_log.new_value, Priority.HIGH.value)
+
+    def test_update_event_audit_logs(self):
+        """Status and handler changes should create detailed audit logs."""
+        event = self._create_test_event()
+
+        success, updated = update_event(
+            event.event_id,
+            status=EventStatus.CONFIRMED.value,
+            handler="测试员",
+            remark="确认超温",
+        )
+
+        self.assertTrue(success)
+        logs = get_audit_logs_for_event(event.event_id)
+        self.assertGreaterEqual(len(logs), 2)
+
+        status_log = next(l for l in logs if l.field_changed == "status")
+        self.assertEqual(status_log.old_value, EventStatus.PENDING.value)
+        self.assertEqual(status_log.new_value, EventStatus.CONFIRMED.value)
+
+        handler_log = next(l for l in logs if l.field_changed == "handler")
+        self.assertEqual(handler_log.old_value, "")
+        self.assertEqual(handler_log.new_value, "测试员")
+
+    def test_get_event_by_id(self):
+        """get_event_by_id should return correct event or None."""
+        event = self._create_test_event()
+
+        found = get_event_by_id(event.event_id)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.event_id, event.event_id)
+
+        not_found = get_event_by_id("nonexistent-id")
+        self.assertIsNone(not_found)
+
+
+class TestVersionConflict(TestBase):
+    """Test version conflict detection for concurrent edits."""
+
+    def _create_test_event(self):
+        event = AnomalyEvent(
+            box_id="BX-TEST-CONF",
+            start_time="2025-06-10 08:00:00",
+            end_time="2025-06-10 09:00:00",
+            max_temperature=-10.0,
+            duration_minutes=60,
+        )
+        save_events([event])
+        return event
+
+    def test_version_increments_on_update(self):
+        """Version should increment on each update."""
+        event = self._create_test_event()
+        self.assertEqual(event.version, 1)
+
+        _, updated1 = update_event(
+            event.event_id, EventStatus.CONFIRMED.value, "测试员", "第一次更新"
+        )
+        self.assertEqual(updated1.version, 2)
+
+        _, updated2 = update_event_assignment(
+            event.event_id, "早班A", "2025-06-11 18:00:00", Priority.HIGH.value, "主管"
+        )
+        self.assertEqual(updated2.version, 3)
+
+        reloaded = get_event_by_id(event.event_id)
+        self.assertEqual(reloaded.version, 3)
+
+    def test_version_conflict_raises_error(self):
+        """Updating with wrong expected version should raise VersionConflictError."""
+        event = self._create_test_event()
+
+        update_event(
+            event.event_id, EventStatus.CONFIRMED.value, "测试员", "第一次更新"
+        )
+
+        with self.assertRaises(VersionConflictError) as ctx:
+            update_event(
+                event.event_id, EventStatus.CLOSED.value, "测试员2", "第二次更新",
+                expected_version=1
+            )
+
+        self.assertEqual(ctx.exception.event_id, event.event_id)
+        self.assertEqual(ctx.exception.current_version, 2)
+        self.assertEqual(ctx.exception.expected_version, 1)
+
+    def test_version_conflict_for_assignment(self):
+        """Assignment update with wrong version should also raise error."""
+        event = self._create_test_event()
+
+        update_event_assignment(
+            event.event_id, "早班A", "2025-06-11 18:00:00", Priority.HIGH.value, "主管"
+        )
+
+        with self.assertRaises(VersionConflictError) as ctx:
+            update_event_assignment(
+                event.event_id, "早班B", "2025-06-12 18:00:00", Priority.MEDIUM.value, "主管2",
+                expected_version=1
+            )
+
+        self.assertEqual(ctx.exception.current_version, 2)
+        self.assertEqual(ctx.exception.expected_version, 1)
+
+    def test_no_version_check_when_expected_version_none(self):
+        """When expected_version is None, no version check should be performed."""
+        event = self._create_test_event()
+
+        update_event(
+            event.event_id, EventStatus.CONFIRMED.value, "测试员", "第一次更新"
+        )
+
+        success, updated = update_event(
+            event.event_id, EventStatus.CLOSED.value, "测试员2", "第二次更新",
+            expected_version=None
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(updated.version, 3)
+
+    def test_last_updated_at_changes_on_update(self):
+        """last_updated_at should be updated on each change."""
+        event = self._create_test_event()
+        original_time = event.last_updated_at
+
+        import time
+        time.sleep(1)
+
+        _, updated = update_event(
+            event.event_id, EventStatus.CONFIRMED.value, "测试员", "更新"
+        )
+
+        self.assertNotEqual(updated.last_updated_at, original_time)
+
+
+class TestRestartConsistencyNewFields(TestBase):
+    """Test that new fields survive restart and are consistent."""
+
+    def test_new_fields_survive_restart(self):
+        """All new fields should be preserved after save/load cycles (simulating restart)."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-newfields")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-newfields", "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+
+        batch = ImportBatch(
+            batch_id="batch-newfields",
+            file_name="test.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash,
+            config_signature=config_sig,
+            row_count=len(df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        reloaded = load_events()
+        ev = reloaded[0]
+        self.assertEqual(ev.assignee, "")
+        self.assertEqual(ev.deadline, "")
+        self.assertEqual(ev.priority, Priority.MEDIUM.value)
+        self.assertEqual(ev.version, 1)
+        self.assertIsNotNone(ev.last_updated_at)
+
+        update_event_assignment(
+            ev.event_id, "早班A", "2025-06-11 18:00:00", Priority.URGENT.value, "主管", "紧急处理"
+        )
+
+        events_before = load_events()
+        audits_before = load_audit_logs()
+
+        events_after = load_events()
+        audits_after = load_audit_logs()
+
+        self.assertEqual(len(events_before), len(events_after))
+        self.assertEqual(len(audits_before), len(audits_after))
+
+        ev_after = next(e for e in events_after if e.event_id == ev.event_id)
+        self.assertEqual(ev_after.assignee, "早班A")
+        self.assertEqual(ev_after.deadline, "2025-06-11 18:00:00")
+        self.assertEqual(ev_after.priority, Priority.URGENT.value)
+        self.assertEqual(ev_after.version, 2)
+
+        audit_fields = [(l.field_changed, l.old_value, l.new_value) for l in audits_after if l.event_id == ev.event_id]
+        self.assertTrue(any(f == ("assignee", "", "早班A") for f in audit_fields))
+        self.assertTrue(any(f == ("priority", Priority.MEDIUM.value, Priority.URGENT.value) for f in audit_fields))
+
+    def test_reanalysis_preserves_new_fields(self):
+        """Re-analysis should preserve assignee, deadline, priority, version, and last_updated_at."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-reanalysis-v1")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig_v1 = compute_config_hash(self.config)
+
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-reanalysis-v1", "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig_v1,
+        )
+
+        batch_v1 = ImportBatch(
+            batch_id="batch-reanalysis-v1",
+            file_name="test.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash,
+            config_signature=config_sig_v1,
+            row_count=len(df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+        )
+        add_events(events, temp_evidence, batch_v1, skipped_logs)
+
+        reloaded = load_events()
+        ev = reloaded[0]
+        update_event_assignment(
+            ev.event_id, "中班B", "2025-06-12 12:00:00", Priority.HIGH.value, "主管", "分派任务"
+        )
+
+        ev_before = get_event_by_id(ev.event_id)
+        self.assertEqual(ev_before.assignee, "中班B")
+        self.assertEqual(ev_before.deadline, "2025-06-12 12:00:00")
+        self.assertEqual(ev_before.priority, Priority.HIGH.value)
+        self.assertEqual(ev_before.version, 2)
+
+        self.config["thresholds"]["temperature_upper_limit"] = -18.0
+        config_sig_v2 = compute_config_hash(self.config)
+
+        new_events, new_temp_evidence = generate_events(
+            valid_rows, self.config, "batch-reanalysis-v2", "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig_v2,
+        )
+
+        batch_v2 = ImportBatch(
+            batch_id="batch-reanalysis-v2",
+            file_name="test.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash,
+            config_signature=config_sig_v2,
+            row_count=len(df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=True,
+        )
+
+        updated, new_count, unchanged = update_events_for_reanalysis(
+            new_events, new_temp_evidence, batch_v2, []
+        )
+        self.assertGreater(updated, 0)
+
+        ev_after = get_event_by_id(ev.event_id)
+        self.assertEqual(ev_after.assignee, "中班B")
+        self.assertEqual(ev_after.deadline, "2025-06-12 12:00:00")
+        self.assertEqual(ev_after.priority, Priority.HIGH.value)
+        self.assertEqual(ev_after.version, 2)
+        self.assertEqual(ev_after.last_updated_at, ev_before.last_updated_at)
+
+        audits_after = get_audit_logs_for_event(ev.event_id)
+        self.assertGreaterEqual(len(audits_after), 3)
+
+
+class TestExportWithNewFields(TestBase):
+    """Test CSV and JSON exports include new fields."""
+
+    def _create_test_events_with_assignments(self):
+        """Helper to create events with various assignments."""
+        events = []
+        for i in range(3):
+            event = AnomalyEvent(
+                box_id=f"BX-EXPORT-{i:03d}",
+                start_time=f"2025-06-10 0{i+8}:00:00",
+                end_time=f"2025-06-10 0{i+9}:00:00",
+                max_temperature=-10.0 - i,
+                duration_minutes=60,
+            )
+            events.append(event)
+        save_events(events)
+
+        update_event_assignment(
+            events[0].event_id, "早班A", "2025-06-11 18:00:00", Priority.HIGH.value, "主管", "高优先级"
+        )
+        update_event_assignment(
+            events[1].event_id, "中班B", "2025-06-12 12:00:00", Priority.MEDIUM.value, "主管", "中优先级"
+        )
+
+        return events
+
+    def test_csv_export_includes_new_fields(self):
+        """CSV export should include all new fields."""
+        events = self._create_test_events_with_assignments()
+
+        df = pd.DataFrame([e.to_dict() for e in load_events()])
+
+        required_columns = [
+            "assignee", "deadline", "priority", "last_updated_at", "version"
+        ]
+        for col in required_columns:
+            self.assertIn(col, df.columns, f"CSV export missing column: {col}")
+
+        ev0_row = df[df["event_id"] == events[0].event_id].iloc[0]
+        self.assertEqual(ev0_row["assignee"], "早班A")
+        self.assertEqual(ev0_row["priority"], Priority.HIGH.value)
+        self.assertEqual(ev0_row["version"], 2)
+
+    def test_json_export_includes_new_fields(self):
+        """JSON export should include all new fields and audit logs."""
+        events = self._create_test_events_with_assignments()
+
+        all_events = load_events()
+        export_data = [e.to_dict() for e in all_events]
+        audit_data = []
+        for e in all_events:
+            audit_data.extend([l.to_dict() for l in get_audit_logs_for_event(e.event_id)])
+
+        payload = {
+            "events": export_data,
+            "audit_logs": audit_data,
+        }
+
+        for ev in payload["events"]:
+            self.assertIn("assignee", ev)
+            self.assertIn("deadline", ev)
+            self.assertIn("priority", ev)
+            self.assertIn("last_updated_at", ev)
+            self.assertIn("version", ev)
+
+        for log in payload["audit_logs"]:
+            self.assertIn("field_changed", log)
+            self.assertIn("old_value", log)
+            self.assertIn("new_value", log)
+
+        assignee_logs = [l for l in payload["audit_logs"] if l["field_changed"] == "assignee"]
+        self.assertEqual(len(assignee_logs), 2)
+
+    def test_exported_audit_logs_have_detailed_info(self):
+        """Exported audit logs should have detailed field change information."""
+        events = self._create_test_events_with_assignments()
+
+        logs = get_audit_logs_for_event(events[0].event_id)
+        self.assertGreaterEqual(len(logs), 3)
+
+        for log in logs:
+            self.assertIsNotNone(log.field_changed)
+            self.assertIsNotNone(log.old_value)
+            self.assertIsNotNone(log.new_value)
+
+        priority_log = next(l for l in logs if l.field_changed == "priority")
+        self.assertEqual(priority_log.old_value, Priority.MEDIUM.value)
+        self.assertEqual(priority_log.new_value, Priority.HIGH.value)
+
+
+class TestOverdueCalculation(TestBase):
+    """Test overdue status calculation."""
+
+    def test_is_overdue_with_past_deadline(self):
+        """Events with past deadlines should be overdue."""
+        from app import _is_overdue
+        self.assertTrue(_is_overdue("2020-01-01 12:00:00"))
+
+    def test_is_overdue_with_future_deadline(self):
+        """Events with future deadlines should not be overdue."""
+        from app import _is_overdue
+        self.assertFalse(_is_overdue("2099-12-31 23:59:59"))
+
+    def test_is_overdue_with_empty_deadline(self):
+        """Events without deadlines should not be overdue."""
+        from app import _is_overdue
+        self.assertFalse(_is_overdue(""))
+        self.assertFalse(_is_overdue(None))
+
+    def test_is_overdue_with_invalid_date(self):
+        """Events with invalid deadlines should not be overdue."""
+        from app import _is_overdue
+        self.assertFalse(_is_overdue("invalid-date"))
 
 
 if __name__ == "__main__":

@@ -9,3 +9,12 @@ validation:
   allow_missing_box_id: true
   reject_duplicate_batch: true
   skip_invalid_timestamp_rows: true
+assignment:
+  default_priority: 中
+  default_assignees:
+    - 早班A
+    - 早班B
+    - 中班A
+    - 中班B
+    - 晚班A
+    - 晚班B

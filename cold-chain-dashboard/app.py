@@ -21,13 +21,14 @@ from core.analyzer import (
     parse_temperature_csv,
     validate_temperature_rows,
 )
-from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch, SkippedRowLog
+from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch, Priority, SkippedRowLog
 from core.persistence import (
     add_events,
     add_evidence_only,
     find_batch_by_raw_data_hash,
     get_audit_logs_for_event,
     get_evidence_for_event,
+    get_event_by_id,
     get_skipped_logs_for_batch,
     is_exact_duplicate_batch,
     is_duplicate_batch,
@@ -35,7 +36,9 @@ from core.persistence import (
     load_batches,
     load_events,
     update_event,
+    update_event_assignment,
     update_events_for_reanalysis,
+    VersionConflictError,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +71,26 @@ def _status_color(s):
         "已关闭": "⚫",
     }
     return m.get(s, "")
+
+
+def _priority_color(p):
+    m = {
+        "低": "⚪",
+        "中": "🔵",
+        "高": "🟠",
+        "紧急": "🔴",
+    }
+    return m.get(p, "⚪")
+
+
+def _is_overdue(deadline: str) -> bool:
+    if not deadline:
+        return False
+    try:
+        deadline_dt = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() > deadline_dt
+    except (ValueError, TypeError):
+        return False
 
 
 if menu == "数据导入":
@@ -226,19 +249,29 @@ elif menu == "异常事件看板":
         else:
             rows = []
             for e in filtered:
+                overdue = _is_overdue(e.deadline)
                 rows.append({
-                    "图标": _status_color(e.status),
+                    "状态": _status_color(e.status),
+                    "优先级": _priority_color(e.priority),
                     "事件ID": e.event_id,
                     "箱号": e.box_id,
                     "开始时间": e.start_time,
-                    "结束时间": e.end_time,
                     "最高温度(°C)": e.max_temperature,
                     "持续(分钟)": e.duration_minutes,
-                    "状态": e.status,
+                    "状态值": e.status,
+                    "优先级值": e.priority,
+                    "责任人": e.assignee or "未分派",
+                    "截止时间": e.deadline or "未设置",
+                    "是否逾期": "⚠️ 已逾期" if overdue else "✅ 正常",
                     "处理人": e.handler,
+                    "最后更新": e.last_updated_at,
                 })
             df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True, column_order=[
+                "状态", "优先级", "事件ID", "箱号", "开始时间", "最高温度(°C)",
+                "持续(分钟)", "状态值", "优先级值", "责任人", "截止时间",
+                "是否逾期", "处理人", "最后更新"
+            ])
 
         selected = st.text_input("输入事件ID查看详情和证据")
         if selected:
@@ -255,7 +288,9 @@ elif menu == "异常事件看板":
                 if log_list:
                     st.markdown("**处理日志:**")
                     for l in log_list:
-                        st.markdown(f"- [{l.timestamp}] {l.action} | 操作人: {l.operator} | 备注: {l.remark}")
+                        field_info = f" | 字段: {l.field_changed}" if l.field_changed else ""
+                        value_info = f" | {l.old_value} → {l.new_value}" if l.old_value or l.new_value else ""
+                        st.markdown(f"- [{l.timestamp}] {l.action} | 操作人: {l.operator}{field_info}{value_info} | 备注: {l.remark}")
             else:
                 st.warning("未找到该事件")
 
@@ -268,11 +303,87 @@ elif menu == "事件复核":
     if not pending_or_confirmed:
         st.info("没有待复核的事件")
     else:
-        options = [f"{e.event_id} | {e.box_id} | {e.status} | {e.start_time}" for e in pending_or_confirmed]
-        selected_idx = st.selectbox("选择事件", range(len(options)), format_func=lambda i: options[i])
-        ev = pending_or_confirmed[selected_idx]
+        all_assignees = sorted(set([e.assignee for e in pending_or_confirmed if e.assignee]))
+        all_statuses = sorted(set([e.status for e in pending_or_confirmed]))
+
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        with col_filter1:
+            filter_assignee = st.multiselect(
+                "按责任人筛选",
+                all_assignees,
+                default=all_assignees,
+            )
+        with col_filter2:
+            filter_status = st.multiselect(
+                "按状态筛选",
+                all_statuses,
+                default=all_statuses,
+            )
+        with col_filter3:
+            filter_overdue = st.selectbox(
+                "按逾期筛选",
+                ["全部", "已逾期", "未逾期"],
+                index=0,
+            )
+
+        filtered = pending_or_confirmed
+        if filter_assignee:
+            filtered = [e for e in filtered if e.assignee in filter_assignee]
+        if filter_status:
+            filtered = [e for e in filtered if e.status in filter_status]
+        if filter_overdue == "已逾期":
+            filtered = [e for e in filtered if _is_overdue(e.deadline)]
+        elif filter_overdue == "未逾期":
+            filtered = [e for e in filtered if not _is_overdue(e.deadline)]
+
+        st.markdown("---")
+        if not filtered:
+            st.info("无匹配事件")
+        else:
+            st.markdown(f"**共 {len(filtered)} 条事件**")
+            rows = []
+            for e in filtered:
+                overdue = _is_overdue(e.deadline)
+                rows.append({
+                    "状态": _status_color(e.status),
+                    "优先级": _priority_color(e.priority),
+                    "事件ID": e.event_id,
+                    "箱号": e.box_id,
+                    "开始时间": e.start_time,
+                    "结束时间": e.end_time,
+                    "最高温度(°C)": e.max_temperature,
+                    "持续(分钟)": e.duration_minutes,
+                    "责任人": e.assignee or "未分派",
+                    "截止时间": e.deadline or "未设置",
+                    "是否逾期": "⚠️ 已逾期" if overdue else "✅ 正常",
+                    "优先级值": e.priority,
+                    "最后更新": e.last_updated_at,
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True, column_order=[
+                "状态", "优先级", "事件ID", "箱号", "开始时间", "最高温度(°C)",
+                "持续(分钟)", "责任人", "截止时间", "是否逾期", "最后更新"
+            ])
+
+        st.markdown("---")
+        options = [f"{e.event_id} | {e.box_id} | {e.status} | {e.start_time}" for e in filtered]
+        selected_idx = st.selectbox("选择事件进行处理", range(len(options)), format_func=lambda i: options[i])
+        ev = filtered[selected_idx]
+
+        if "current_event_version" not in st.session_state or st.session_state.get("current_event_id") != ev.event_id:
+            st.session_state.current_event_id = ev.event_id
+            st.session_state.current_event_version = ev.version
+
+        if ev.version != st.session_state.current_event_version:
+            st.warning(
+                f"⚠️ 该事件已被其他用户更新！当前版本: {ev.version}, 您加载的版本: {st.session_state.current_event_version}。"
+                "请刷新页面查看最新数据后再操作。"
+            )
+            st.session_state.current_event_version = ev.version
 
         st.markdown(f"**箱号:** {ev.box_id}  |  **时间:** {ev.start_time} ~ {ev.end_time}  |  **最高温度:** {ev.max_temperature}°C  |  **持续:** {ev.duration_minutes}分钟")
+        st.markdown(f"**当前状态:** {_status_color(ev.status)} {ev.status}  |  **优先级:** {_priority_color(ev.priority)} {ev.priority}  |  **责任人:** {ev.assignee or '未分派'}  |  **截止时间:** {ev.deadline or '未设置'}")
+        st.markdown(f"**版本:** {ev.version}  |  **最后更新:** {ev.last_updated_at}")
 
         ev_list = get_evidence_for_event(ev.event_id)
         if ev_list:
@@ -284,19 +395,73 @@ elif menu == "事件复核":
         if log_list:
             with st.expander("历史处理日志"):
                 for l in log_list:
-                    st.markdown(f"- [{l.timestamp}] {l.action} | 操作人: {l.operator} | 备注: {l.remark}")
+                    field_info = f" | 字段: {l.field_changed}" if l.field_changed else ""
+                    value_info = f" | {l.old_value} → {l.new_value}" if l.old_value or l.new_value else ""
+                    st.markdown(f"- [{l.timestamp}] {l.action} | 操作人: {l.operator}{field_info}{value_info} | 备注: {l.remark}")
 
-        new_status = st.selectbox("变更状态为", [s.value for s in EventStatus], index=0)
-        handler = st.text_input("处理人")
-        remark = st.text_area("处理备注")
+        tab1, tab2 = st.tabs(["📋 状态变更", "👤 班次交接/责任人分派"])
 
-        if st.button("提交复核", type="primary"):
-            if not handler.strip():
-                st.error("请填写处理人")
-            else:
-                update_event(ev.event_id, new_status, handler.strip(), remark.strip())
-                st.success(f"事件 {ev.event_id} 已更新为: {new_status}")
-                st.rerun()
+        with tab1:
+            new_status = st.selectbox("变更状态为", [s.value for s in EventStatus], index=list(EventStatus).index(EventStatus(ev.status)))
+            handler = st.text_input("处理人", value=ev.handler)
+            remark = st.text_area("处理备注", value=ev.handler_remark)
+
+            if st.button("提交复核", type="primary", key="submit_review"):
+                if not handler.strip():
+                    st.error("请填写处理人")
+                else:
+                    try:
+                        success, updated_ev = update_event(
+                            ev.event_id, new_status, handler.strip(), remark.strip(),
+                            expected_version=st.session_state.current_event_version
+                        )
+                        if success:
+                            st.success(f"事件 {ev.event_id} 已更新为: {new_status}")
+                            st.session_state.current_event_version = updated_ev.version
+                            st.rerun()
+                    except VersionConflictError as e:
+                        st.error(f"❌ {str(e)}")
+                        st.session_state.current_event_version = e.current_version
+
+        with tab2:
+            assignee = st.text_input("责任人", value=ev.assignee)
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                deadline_date = st.date_input(
+                    "截止日期",
+                    value=datetime.strptime(ev.deadline, "%Y-%m-%d %H:%M:%S").date() if ev.deadline else datetime.now().date()
+                )
+            with col_d2:
+                deadline_time = st.time_input(
+                    "截止时间",
+                    value=datetime.strptime(ev.deadline, "%Y-%m-%d %H:%M:%S").time() if ev.deadline else datetime.now().time().replace(minute=0, second=0)
+                )
+            deadline_str = f"{deadline_date.strftime('%Y-%m-%d')} {deadline_time.strftime('%H:%M:%S')}"
+            priority = st.selectbox(
+                "优先级",
+                [p.value for p in Priority],
+                index=list(Priority).index(Priority(ev.priority))
+            )
+            operator = st.text_input("操作人", key="assign_operator")
+            assign_remark = st.text_area("分派备注", key="assign_remark")
+
+            if st.button("提交分派", type="primary", key="submit_assignment"):
+                if not operator.strip():
+                    st.error("请填写操作人")
+                else:
+                    try:
+                        success, updated_ev = update_event_assignment(
+                            ev.event_id, assignee.strip(), deadline_str, priority,
+                            operator.strip(), assign_remark.strip(),
+                            expected_version=st.session_state.current_event_version
+                        )
+                        if success:
+                            st.success(f"事件 {ev.event_id} 已分派给: {assignee or '未设置'}")
+                            st.session_state.current_event_version = updated_ev.version
+                            st.rerun()
+                    except VersionConflictError as e:
+                        st.error(f"❌ {str(e)}")
+                        st.session_state.current_event_version = e.current_version
 
 
 elif menu == "导出":
@@ -317,8 +482,25 @@ elif menu == "导出":
         if not filtered:
             st.warning("无匹配事件")
         else:
+            export_events = []
+            for e in filtered:
+                event_dict = e.to_dict()
+                event_dict["is_overdue"] = _is_overdue(e.deadline)
+                event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
+                export_events.append(event_dict)
+
             if fmt == "CSV":
-                df = pd.DataFrame([e.to_dict() for e in filtered])
+                df = pd.DataFrame(export_events)
+                column_order = [
+                    "event_id", "box_id", "status", "priority", "assignee", "deadline",
+                    "is_overdue", "overdue_status", "start_time", "end_time",
+                    "max_temperature", "duration_minutes", "handler", "handler_remark",
+                    "close_time", "last_updated_at", "version", "created_at",
+                    "batch_id", "raw_data_hash", "config_signature", "event_signature",
+                    "evidence_ids"
+                ]
+                available_cols = [c for c in column_order if c in df.columns]
+                df = df[available_cols]
                 buf = io.StringIO()
                 df.to_csv(buf, index=False, encoding=cfg.get("export", {}).get("default_encoding", "utf-8-sig"))
                 st.download_button(
@@ -328,7 +510,6 @@ elif menu == "导出":
                     mime="text/csv",
                 )
             else:
-                data = [e.to_dict() for e in filtered]
                 evidence_data = []
                 for e in filtered:
                     evidence_data.extend([ev.to_dict() for ev in get_evidence_for_event(e.event_id)])
@@ -336,10 +517,16 @@ elif menu == "导出":
                 for e in filtered:
                     audit_data.extend([l.to_dict() for l in get_audit_logs_for_event(e.event_id)])
                 payload = {
-                    "events": data,
+                    "events": export_events,
                     "evidence": evidence_data,
                     "audit_logs": audit_data,
                     "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "export_metadata": {
+                        "total_events": len(export_events),
+                        "total_evidence": len(evidence_data),
+                        "total_audit_logs": len(audit_data),
+                        "filter_status": status_filter,
+                    }
                 }
                 st.download_button(
                     "下载 JSON",

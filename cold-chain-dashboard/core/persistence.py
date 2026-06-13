@@ -4,7 +4,7 @@ import threading
 from datetime import datetime
 from typing import Optional, Tuple
 
-from .models import AnomalyEvent, AuditLog, Evidence, ImportBatch, SkippedRowLog
+from .models import AnomalyEvent, AuditLog, Evidence, ImportBatch, Priority, SkippedRowLog
 
 _BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "store")
 _EVENTS_FILE = os.path.join(_BASE_DIR, "events.json")
@@ -36,9 +36,36 @@ def _write_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _migrate_event_data(event_dict: dict) -> dict:
+    defaults = {
+        "assignee": "",
+        "deadline": "",
+        "priority": Priority.MEDIUM.value,
+        "last_updated_at": event_dict.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "version": 1,
+    }
+    for key, default_value in defaults.items():
+        if key not in event_dict:
+            event_dict[key] = default_value
+    return event_dict
+
+
+def _migrate_audit_log_data(log_dict: dict) -> dict:
+    defaults = {
+        "field_changed": "",
+        "old_value": "",
+        "new_value": "",
+    }
+    for key, default_value in defaults.items():
+        if key not in log_dict:
+            log_dict[key] = default_value
+    return log_dict
+
+
 def load_events() -> list[AnomalyEvent]:
     data = _read_json(_EVENTS_FILE)
-    return [AnomalyEvent(**d) for d in data]
+    migrated_data = [_migrate_event_data(d) for d in data]
+    return [AnomalyEvent(**d) for d in migrated_data]
 
 
 def save_events(events: list[AnomalyEvent]):
@@ -56,7 +83,8 @@ def save_evidence(evidences: list[Evidence]):
 
 def load_audit_logs() -> list[AuditLog]:
     data = _read_json(_AUDIT_FILE)
-    return [AuditLog(**d) for d in data]
+    migrated_data = [_migrate_audit_log_data(d) for d in data]
+    return [AuditLog(**d) for d in migrated_data]
 
 
 def save_audit_logs(logs: list[AuditLog]):
@@ -119,29 +147,181 @@ def add_evidence_only(new_evidence: list[Evidence]):
         save_evidence(existing_evidence)
 
 
-def update_event(event_id: str, status: str, handler: str, remark: str, close_time: str = ""):
+class VersionConflictError(Exception):
+    def __init__(self, event_id: str, current_version: int, expected_version: int):
+        self.event_id = event_id
+        self.current_version = current_version
+        self.expected_version = expected_version
+        super().__init__(f"事件 {event_id} 已被更新（当前版本: {current_version}, 期望版本: {expected_version}）")
+
+
+def _append_audit_log(
+    audit_logs: list[AuditLog],
+    event_id: str,
+    action: str,
+    operator: str,
+    remark: str = "",
+    field_changed: str = "",
+    old_value: str = "",
+    new_value: str = "",
+):
+    log = AuditLog(
+        event_id=event_id,
+        action=action,
+        operator=operator,
+        remark=remark,
+        field_changed=field_changed,
+        old_value=str(old_value),
+        new_value=str(new_value),
+    )
+    audit_logs.append(log)
+
+
+def update_event(event_id: str, status: str, handler: str, remark: str, close_time: str = "", expected_version: int = None) -> Tuple[bool, AnomalyEvent]:
     with _lock:
         events = load_events()
         audit_logs = load_audit_logs()
+        event = None
         for ev in events:
             if ev.event_id == event_id:
-                old_status = ev.status
-                ev.status = status
-                ev.handler = handler
-                ev.handler_remark = remark
-                if status == "已关闭" and not ev.close_time:
-                    from datetime import datetime
-                    ev.close_time = close_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log = AuditLog(
-                    event_id=event_id,
-                    action=f"状态变更: {old_status} -> {status}",
-                    operator=handler,
-                    remark=remark,
-                )
-                audit_logs.append(log)
+                event = ev
                 break
+
+        if not event:
+            return False, None
+
+        if expected_version is not None and event.version != expected_version:
+            raise VersionConflictError(event_id, event.version, expected_version)
+
+        old_status = event.status
+        old_handler = event.handler
+        old_remark = event.handler_remark
+
+        event.status = status
+        event.handler = handler
+        event.handler_remark = remark
+        event.version += 1
+        event.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if status == "已关闭" and not event.close_time:
+            event.close_time = close_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if old_status != status:
+            _append_audit_log(
+                audit_logs, event_id,
+                action=f"状态变更: {old_status} -> {status}",
+                operator=handler,
+                remark=remark,
+                field_changed="status",
+                old_value=old_status,
+                new_value=status,
+            )
+
+        if old_handler != handler:
+            _append_audit_log(
+                audit_logs, event_id,
+                action=f"处理人变更: {old_handler or '未设置'} -> {handler}",
+                operator=handler,
+                remark=remark,
+                field_changed="handler",
+                old_value=old_handler,
+                new_value=handler,
+            )
+
+        if old_remark != remark:
+            _append_audit_log(
+                audit_logs, event_id,
+                action="处理备注更新",
+                operator=handler,
+                remark=remark,
+                field_changed="handler_remark",
+                old_value=old_remark,
+                new_value=remark,
+            )
+
         save_events(events)
         save_audit_logs(audit_logs)
+        return True, event
+
+
+def update_event_assignment(
+    event_id: str,
+    assignee: str,
+    deadline: str,
+    priority: str,
+    operator: str,
+    remark: str = "",
+    expected_version: int = None,
+) -> Tuple[bool, AnomalyEvent]:
+    with _lock:
+        events = load_events()
+        audit_logs = load_audit_logs()
+        event = None
+        for ev in events:
+            if ev.event_id == event_id:
+                event = ev
+                break
+
+        if not event:
+            return False, None
+
+        if expected_version is not None and event.version != expected_version:
+            raise VersionConflictError(event_id, event.version, expected_version)
+
+        old_assignee = event.assignee
+        old_deadline = event.deadline
+        old_priority = event.priority
+
+        event.assignee = assignee
+        event.deadline = deadline
+        event.priority = priority
+        event.version += 1
+        event.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if old_assignee != assignee:
+            _append_audit_log(
+                audit_logs, event_id,
+                action=f"责任人分派: {old_assignee or '未设置'} -> {assignee}",
+                operator=operator,
+                remark=remark,
+                field_changed="assignee",
+                old_value=old_assignee,
+                new_value=assignee,
+            )
+
+        if old_deadline != deadline:
+            _append_audit_log(
+                audit_logs, event_id,
+                action=f"截止时间变更: {old_deadline or '未设置'} -> {deadline}",
+                operator=operator,
+                remark=remark,
+                field_changed="deadline",
+                old_value=old_deadline,
+                new_value=deadline,
+            )
+
+        if old_priority != priority:
+            _append_audit_log(
+                audit_logs, event_id,
+                action=f"优先级变更: {old_priority} -> {priority}",
+                operator=operator,
+                remark=remark,
+                field_changed="priority",
+                old_value=old_priority,
+                new_value=priority,
+            )
+
+        save_events(events)
+        save_audit_logs(audit_logs)
+        return True, event
+
+
+def get_event_by_id(event_id: str) -> Optional[AnomalyEvent]:
+    events = load_events()
+    for ev in events:
+        if ev.event_id == event_id:
+            return ev
+    return None
 
 
 def is_duplicate_batch(file_hash: str) -> bool:
@@ -267,6 +447,11 @@ def update_events_for_reanalysis(
                 new_ev.handler_remark = matched_old.handler_remark
                 new_ev.close_time = matched_old.close_time
                 new_ev.created_at = matched_old.created_at
+                new_ev.assignee = matched_old.assignee
+                new_ev.deadline = matched_old.deadline
+                new_ev.priority = matched_old.priority
+                new_ev.last_updated_at = matched_old.last_updated_at
+                new_ev.version = matched_old.version
                 new_event_ids_map[sig] = matched_old.event_id
                 matched_old_event_ids.add(matched_old.event_id)
                 updated += 1
