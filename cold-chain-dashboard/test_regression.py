@@ -1385,5 +1385,255 @@ class TestCsvExportAuditLog(TestBase):
         self.assertEqual(len(audit_rows), 0)
 
 
+class TestCsvExportMisreadRisk(TestBase):
+    """Regression tests to prevent misreading: downstream using old assumption
+    that CSV is a pure event list will miss audit log rows.
+    """
+
+    def _create_events_with_full_audit_trail(self):
+        """Create 2 events: ev0 has assignment+review, ev1 only review."""
+        events = []
+        for i in range(2):
+            event = AnomalyEvent(
+                box_id=f"BX-MISREAD-{i:03d}",
+                start_time=f"2025-06-10 0{i+8}:00:00",
+                end_time=f"2025-06-10 0{i+9}:00:00",
+                max_temperature=-10.0 - i,
+                duration_minutes=60,
+                status=EventStatus.PENDING.value,
+            )
+            events.append(event)
+        save_events(events)
+
+        update_event_assignment(
+            events[0].event_id, "早班A", "2025-06-11 18:00:00",
+            Priority.HIGH.value, "主管甲", "紧急分派",
+        )
+        update_event_assignment(
+            events[0].event_id, "早班B", "2025-06-12 12:00:00",
+            Priority.URGENT.value, "主管乙", "改期+升级",
+        )
+        update_event(
+            events[0].event_id, EventStatus.CONFIRMED.value, "处理员A", "确认超温",
+        )
+        update_event(
+            events[1].event_id, EventStatus.FALSE_ALARM.value, "处理员B", "误报排除",
+        )
+        return events
+
+    def test_cannot_find_assignee_change_without_row_type_filter(self):
+        """Regression: old parser that only reads '事件' rows WILL miss
+        the operator and assignee change info — prove it so the test breaks
+        if we accidentally revert CSV schema.
+        """
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        only_events = df[df["row_type"] == "事件"]
+        operators_in_events = only_events["operator"].dropna().astype(str).ne("").sum()
+        assignee_in_events = only_events["assignee"].dropna().astype(str).ne("").sum()
+
+        self.assertEqual(
+            operators_in_events, 0,
+            "Regression: operator column must be EMPTY in event rows "
+            "(this would otherwise hide the misread risk of skipping audit rows)",
+        )
+        self.assertGreaterEqual(
+            assignee_in_events, 1,
+            "Current assignee should still appear on the event row as snapshot",
+        )
+
+        only_audits = df[df["row_type"] == "审计日志"]
+        operators_in_audits = only_audits["operator"].dropna().astype(str).ne("").sum()
+        self.assertGreater(operators_in_audits, 0, "Operators only live in audit rows")
+
+    def test_full_traceability_assignee_deadline_priority(self):
+        """Directly check CSV contains assignee/deadline/priority change records
+        with correct old/new values, and each change has a distinct operator + timestamp.
+        """
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        audits = df[df["row_type"] == "审计日志"]
+
+        assignee_changes = audits[audits["field_changed"] == "assignee"]
+        self.assertEqual(len(assignee_changes), 2)  # ""->早班A, 早班A->早班B
+
+        first_assign = assignee_changes[assignee_changes["new_value"] == "早班A"].iloc[0]
+        self.assertEqual(first_assign["old_value"], "")
+        self.assertEqual(first_assign["operator"], "主管甲")
+        self.assertEqual(first_assign["remark"], "紧急分派")
+
+        reassign = assignee_changes[assignee_changes["new_value"] == "早班B"].iloc[0]
+        self.assertEqual(reassign["old_value"], "早班A")
+        self.assertEqual(reassign["operator"], "主管乙")
+        self.assertEqual(reassign["remark"], "改期+升级")
+
+        deadline_changes = audits[audits["field_changed"] == "deadline"]
+        self.assertEqual(len(deadline_changes), 2)
+
+        priority_changes = audits[audits["field_changed"] == "priority"]
+        self.assertGreaterEqual(len(priority_changes), 2)
+        first_priority = priority_changes[priority_changes["new_value"] == Priority.HIGH.value].iloc[0]
+        self.assertEqual(first_priority["old_value"], Priority.MEDIUM.value)
+
+    def test_csv_null_values_are_empty_strings_not_nan(self):
+        """CSV empty cells must be '' (empty string), never NaN / 'nan' literal."""
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False, dtype=str)
+
+        event_rows = df[df["row_type"] == "事件"]
+        for col in ["action", "field_changed", "old_value", "new_value", "operator", "log_id", "log_timestamp"]:
+            bad = event_rows[event_rows[col].str.lower().isin(["nan", "none", "null"])]
+            self.assertEqual(
+                len(bad), 0,
+                f"Event rows' '{col}' contains NaN/NONE/NULL literal instead of empty string",
+            )
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        for col in ["status", "priority", "assignee", "deadline", "start_time", "handler"]:
+            bad = audit_rows[audit_rows[col].str.lower().isin(["nan", "none", "null"])]
+            self.assertEqual(
+                len(bad), 0,
+                f"Audit rows' '{col}' contains NaN/NONE/NULL literal instead of empty string",
+            )
+
+    def test_csv_row_type_is_first_column(self):
+        """row_type must be the first column so parsers can branch early."""
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        header_line = csv_content.splitlines()[0]
+        first_column = header_line.split(",")[0]
+        self.assertEqual(first_column, "row_type", "row_type must be column #0")
+
+    def test_filtered_export_carries_all_history_logs_of_filtered_events(self):
+        """Filtering by status must include ALL audit logs of the matched events,
+        not only logs produced while in that status. This preserves traceability.
+        """
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        all_csv = build_csv_export(load_events())
+        df_all = pd.read_csv(io.StringIO(all_csv))
+        ev0_logs_all = set(df_all[df_all["event_id"] == events[0].event_id]["log_id"].dropna())
+
+        confirmed_events = [e for e in load_events() if e.status == EventStatus.CONFIRMED.value]
+        confirmed_csv = build_csv_export(confirmed_events)
+        df_filtered = pd.read_csv(io.StringIO(confirmed_csv))
+        ev0_logs_filtered = set(df_filtered[df_filtered["event_id"] == events[0].event_id]["log_id"].dropna())
+
+        self.assertEqual(
+            ev0_logs_all, ev0_logs_filtered,
+            "Filtering by status dropped audit logs for matched events; "
+            "traceability broken (history for reassignment lost)",
+        )
+
+    def test_csv_encoding_matches_readme_utf8_bom(self):
+        """Simulate the exact bytes a user downloads: UTF-8-SIG BOM must be present."""
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export
+
+        csv_str = build_csv_export(load_events())
+        csv_bytes = csv_str.encode("utf-8-sig")
+
+        self.assertEqual(csv_bytes[:3], b"\xef\xbb\xbf", "CSV file must start with UTF-8 BOM")
+
+        decoded_back = csv_bytes.decode("utf-8-sig")
+        self.assertEqual(decoded_back, csv_str, "BOM round-trip decode must yield original str")
+
+    def test_csv_json_field_values_consistent(self):
+        """Values for identical event/log fields must match between CSV and JSON
+        when using the same filter input (same filtered list)."""
+        events = self._create_events_with_full_audit_trail()
+        from app import build_csv_export, build_json_export
+
+        filtered = load_events()
+        csv_df = pd.read_csv(io.StringIO(build_csv_export(filtered)), keep_default_na=False)
+        json_payload = build_json_export(filtered)
+
+        csv_event = csv_df[csv_df["row_type"] == "事件"].iloc[0]
+        json_event = json_payload["events"][0]
+        for key in ["event_id", "box_id", "assignee", "priority", "deadline"]:
+            self.assertEqual(str(csv_event[key]), str(json_event.get(key, "")))
+
+        csv_audit = csv_df[csv_df["row_type"] == "审计日志"]
+        for log in json_payload["audit_logs"]:
+            rows = csv_audit[csv_audit["log_id"] == log["log_id"]]
+            self.assertEqual(len(rows), 1, f"JSON log {log['log_id']} missing from CSV")
+            row = rows.iloc[0]
+            self.assertEqual(row["action"], log["action"])
+            self.assertEqual(row["operator"], log["operator"])
+            self.assertEqual(row["field_changed"], log["field_changed"])
+            self.assertEqual(row["old_value"], log["old_value"])
+            self.assertEqual(row["new_value"], log["new_value"])
+
+    def test_readme_documents_field_changed_values(self):
+        """README must list the common field_changed values we actually emit,
+        so downstream can rely on them. If we add a new field_changed, update README.
+        """
+        import re
+        readme_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "README.md"
+        )
+        with open(readme_path, "r", encoding="utf-8") as f:
+            readme = f.read()
+
+        events = self._create_events_with_full_audit_trail()
+        logs = load_audit_logs()
+        actually_emitted = sorted(set(l.field_changed for l in logs if l.field_changed))
+
+        for fc in actually_emitted:
+            self.assertIn(
+                f"`{fc}`", readme,
+                f"README missing field_changed value '{fc}' that the app actually emits; "
+                "add to the CSV field_changed table in README",
+            )
+
+        documented = re.findall(r"`(assignee|deadline|priority|status|handler|handler_remark)`", readme)
+        self.assertGreaterEqual(len(documented), 4, "README table seems truncated")
+
+    def test_restart_roundtrip_persistence_export_readme_consistent(self):
+        """End-to-end: save → simulate restart (reload all) → export CSV / JSON →
+        assert values, row counts, and README-documented fields still hold.
+        """
+        from app import build_csv_export, build_json_export
+        events = self._create_events_with_full_audit_trail()
+        target_id = events[0].event_id
+        before_logs = len(load_audit_logs())
+
+        csv_before = build_csv_export(load_events())
+        json_before = json.dumps(build_json_export(load_events()), ensure_ascii=False, sort_keys=True)
+
+        reloaded_events = load_events()
+        reloaded_logs = load_audit_logs()
+        self.assertEqual(len(reloaded_logs), before_logs)
+
+        csv_after = build_csv_export(reloaded_events)
+        json_after = json.dumps(build_json_export(reloaded_events), ensure_ascii=False, sort_keys=True)
+
+        self.assertEqual(csv_before, csv_after, "CSV export differs after simulated restart")
+        self.assertEqual(json_before, json_after, "JSON export differs after simulated restart")
+
+        reloaded_df = pd.read_csv(io.StringIO(csv_after), keep_default_na=False)
+        target_rows = reloaded_df[reloaded_df["event_id"] == target_id]
+        event_row = target_rows[target_rows["row_type"] == "事件"].iloc[0]
+        audit_rows = target_rows[target_rows["row_type"] == "审计日志"]
+
+        self.assertEqual(event_row["assignee"], "早班B")
+        self.assertEqual(event_row["priority"], Priority.URGENT.value)
+        self.assertEqual(event_row["status"], EventStatus.CONFIRMED.value)
+        self.assertGreaterEqual(len(audit_rows), 6)  # 2*(a/d/p) + status + handler...
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

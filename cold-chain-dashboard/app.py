@@ -93,7 +93,11 @@ def _is_overdue(deadline: str) -> bool:
         return False
 
 
-def build_csv_export(events: list, encoding: str = "utf-8-sig") -> str:
+def build_csv_export(events: list) -> str:
+    """生成 CSV 字符串内容（UTF-8）。
+    返回 str 而非 bytes，编码由调用方控制（页面端固定 UTF-8-SIG 带 BOM，
+    便于 Excel 直接打开中文），避免内部对 StringIO 传 encoding 参数无效。
+    """
     csv_rows = []
     for e in events:
         event_dict = e.to_dict()
@@ -132,7 +136,7 @@ def build_csv_export(events: list, encoding: str = "utf-8-sig") -> str:
     available_cols = [c for c in column_order if c in df.columns]
     df = df[available_cols]
     buf = io.StringIO()
-    df.to_csv(buf, index=False, encoding=encoding)
+    df.to_csv(buf, index=False, na_rep="")
     return buf.getvalue()
 
 
@@ -548,10 +552,11 @@ elif menu == "导出":
             st.warning("无匹配事件")
         else:
             if fmt == "CSV":
-                csv_content = build_csv_export(filtered, cfg.get("export", {}).get("default_encoding", "utf-8-sig"))
+                csv_str = build_csv_export(filtered)
+                csv_bytes = csv_str.encode(cfg.get("export", {}).get("default_encoding", "utf-8-sig"))
                 st.download_button(
                     "下载 CSV",
-                    data=csv_content.encode("utf-8-sig"),
+                    data=csv_bytes,
                     file_name=f"cold_chain_events_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                 )
