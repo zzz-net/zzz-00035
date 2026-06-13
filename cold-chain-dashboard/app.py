@@ -93,6 +93,71 @@ def _is_overdue(deadline: str) -> bool:
         return False
 
 
+def build_csv_export(events: list, encoding: str = "utf-8-sig") -> str:
+    csv_rows = []
+    for e in events:
+        event_dict = e.to_dict()
+        event_dict["is_overdue"] = _is_overdue(e.deadline)
+        event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
+        event_dict["row_type"] = "事件"
+        csv_rows.append(event_dict)
+
+        for log in get_audit_logs_for_event(e.event_id):
+            csv_rows.append({
+                "row_type": "审计日志",
+                "event_id": e.event_id,
+                "box_id": e.box_id,
+                "log_id": log.log_id,
+                "action": log.action,
+                "field_changed": log.field_changed,
+                "old_value": log.old_value,
+                "new_value": log.new_value,
+                "operator": log.operator,
+                "log_timestamp": log.timestamp,
+                "remark": log.remark,
+            })
+
+    df = pd.DataFrame(csv_rows)
+    column_order = [
+        "row_type", "event_id", "box_id",
+        "status", "priority", "assignee", "deadline",
+        "is_overdue", "overdue_status", "start_time", "end_time",
+        "max_temperature", "duration_minutes", "handler", "handler_remark",
+        "close_time", "last_updated_at", "version", "created_at",
+        "log_id", "action", "field_changed", "old_value", "new_value",
+        "operator", "log_timestamp", "remark",
+        "batch_id", "raw_data_hash", "config_signature", "event_signature",
+        "evidence_ids",
+    ]
+    available_cols = [c for c in column_order if c in df.columns]
+    df = df[available_cols]
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, encoding=encoding)
+    return buf.getvalue()
+
+
+def build_json_export(events: list) -> dict:
+    export_events = []
+    for e in events:
+        event_dict = e.to_dict()
+        event_dict["is_overdue"] = _is_overdue(e.deadline)
+        event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
+        export_events.append(event_dict)
+
+    evidence_data = []
+    for e in events:
+        evidence_data.extend([ev.to_dict() for ev in get_evidence_for_event(e.event_id)])
+    audit_data = []
+    for e in events:
+        audit_data.extend([l.to_dict() for l in get_audit_logs_for_event(e.event_id)])
+    return {
+        "events": export_events,
+        "evidence": evidence_data,
+        "audit_logs": audit_data,
+        "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 if menu == "数据导入":
     st.header("数据导入")
     st.markdown("依次上传温度 CSV、收货备注 CSV 和承运商告警 JSON，系统将按阈值自动生成异常事件。")
@@ -482,51 +547,21 @@ elif menu == "导出":
         if not filtered:
             st.warning("无匹配事件")
         else:
-            export_events = []
-            for e in filtered:
-                event_dict = e.to_dict()
-                event_dict["is_overdue"] = _is_overdue(e.deadline)
-                event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
-                export_events.append(event_dict)
-
             if fmt == "CSV":
-                df = pd.DataFrame(export_events)
-                column_order = [
-                    "event_id", "box_id", "status", "priority", "assignee", "deadline",
-                    "is_overdue", "overdue_status", "start_time", "end_time",
-                    "max_temperature", "duration_minutes", "handler", "handler_remark",
-                    "close_time", "last_updated_at", "version", "created_at",
-                    "batch_id", "raw_data_hash", "config_signature", "event_signature",
-                    "evidence_ids"
-                ]
-                available_cols = [c for c in column_order if c in df.columns]
-                df = df[available_cols]
-                buf = io.StringIO()
-                df.to_csv(buf, index=False, encoding=cfg.get("export", {}).get("default_encoding", "utf-8-sig"))
+                csv_content = build_csv_export(filtered, cfg.get("export", {}).get("default_encoding", "utf-8-sig"))
                 st.download_button(
                     "下载 CSV",
-                    data=buf.getvalue().encode("utf-8-sig"),
+                    data=csv_content.encode("utf-8-sig"),
                     file_name=f"cold_chain_events_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                 )
             else:
-                evidence_data = []
-                for e in filtered:
-                    evidence_data.extend([ev.to_dict() for ev in get_evidence_for_event(e.event_id)])
-                audit_data = []
-                for e in filtered:
-                    audit_data.extend([l.to_dict() for l in get_audit_logs_for_event(e.event_id)])
-                payload = {
-                    "events": export_events,
-                    "evidence": evidence_data,
-                    "audit_logs": audit_data,
-                    "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "export_metadata": {
-                        "total_events": len(export_events),
-                        "total_evidence": len(evidence_data),
-                        "total_audit_logs": len(audit_data),
-                        "filter_status": status_filter,
-                    }
+                payload = build_json_export(filtered)
+                payload["export_metadata"] = {
+                    "total_events": len(payload["events"]),
+                    "total_evidence": len(payload["evidence"]),
+                    "total_audit_logs": len(payload["audit_logs"]),
+                    "filter_status": status_filter,
                 }
                 st.download_button(
                     "下载 JSON",

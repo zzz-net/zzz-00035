@@ -1173,5 +1173,217 @@ class TestOverdueCalculation(TestBase):
         self.assertFalse(_is_overdue("invalid-date"))
 
 
+class TestCsvExportAuditLog(TestBase):
+    """Test that CSV export includes audit log rows with full traceability."""
+
+    def _create_events_with_audit_trail(self):
+        events = []
+        for i in range(2):
+            event = AnomalyEvent(
+                box_id=f"BX-AUDIT-{i:03d}",
+                start_time=f"2025-06-10 0{i+8}:00:00",
+                end_time=f"2025-06-10 0{i+9}:00:00",
+                max_temperature=-10.0 - i,
+                duration_minutes=60,
+            )
+            events.append(event)
+        save_events(events)
+
+        update_event_assignment(
+            events[0].event_id, "早班A", "2025-06-11 18:00:00",
+            Priority.HIGH.value, "主管", "紧急分派",
+        )
+        update_event(
+            events[1].event_id, EventStatus.CONFIRMED.value, "测试员", "确认超温",
+        )
+
+        return events
+
+    def test_csv_contains_audit_log_rows(self):
+        """CSV export must contain audit log rows, not just event rows."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        self.assertGreater(len(audit_rows), 0, "CSV export has zero audit log rows")
+
+    def test_csv_audit_log_has_required_columns(self):
+        """CSV audit log rows must include action, field_changed, old_value, new_value, operator."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        required_cols = ["action", "field_changed", "old_value", "new_value", "operator"]
+        for col in required_cols:
+            self.assertIn(col, df.columns, f"CSV export missing column: {col}")
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        for col in required_cols:
+            non_empty = audit_rows[col].dropna().astype(str).ne("").sum()
+            self.assertGreater(non_empty, 0, f"CSV audit log column '{col}' is all empty")
+
+    def test_csv_audit_log_traces_assignee_change(self):
+        """CSV audit log must contain the assignee change from the assignment update."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        assignee_logs = audit_rows[audit_rows["field_changed"] == "assignee"]
+        self.assertGreater(len(assignee_logs), 0, "No assignee change found in CSV audit logs")
+
+        row = assignee_logs.iloc[0]
+        self.assertEqual(str(row["new_value"]).strip(), "早班A")
+
+    def test_csv_audit_log_traces_priority_change(self):
+        """CSV audit log must contain the priority change from the assignment update."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        priority_logs = audit_rows[audit_rows["field_changed"] == "priority"]
+        self.assertGreater(len(priority_logs), 0, "No priority change found in CSV audit logs")
+
+        row = priority_logs.iloc[0]
+        self.assertEqual(str(row["old_value"]).strip(), Priority.MEDIUM.value)
+        self.assertEqual(str(row["new_value"]).strip(), Priority.HIGH.value)
+
+    def test_csv_audit_log_traces_deadline_change(self):
+        """CSV audit log must contain the deadline change from the assignment update."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        deadline_logs = audit_rows[audit_rows["field_changed"] == "deadline"]
+        self.assertGreater(len(deadline_logs), 0, "No deadline change found in CSV audit logs")
+
+    def test_csv_audit_log_traces_status_change(self):
+        """CSV audit log must contain the status change from the review update."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        status_logs = audit_rows[audit_rows["field_changed"] == "status"]
+        self.assertGreater(len(status_logs), 0, "No status change found in CSV audit logs")
+
+    def test_csv_event_rows_still_intact(self):
+        """CSV event rows must still contain all event fields after adding audit log support."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        event_rows = df[df["row_type"] == "事件"]
+        self.assertEqual(len(event_rows), 2)
+
+        required_event_cols = [
+            "event_id", "box_id", "status", "priority", "assignee",
+            "deadline", "start_time", "end_time", "max_temperature",
+            "duration_minutes", "handler", "version", "created_at",
+        ]
+        for col in required_event_cols:
+            self.assertIn(col, df.columns, f"CSV event rows missing column: {col}")
+
+    def test_csv_audit_rows_carry_event_keys(self):
+        """CSV audit log rows must carry event_id and box_id for traceability."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        self.assertTrue(
+            (audit_rows["event_id"].notna() & audit_rows["event_id"].astype(str).ne("")).all(),
+            "Some audit log rows are missing event_id",
+        )
+        self.assertTrue(
+            (audit_rows["box_id"].notna() & audit_rows["box_id"].astype(str).ne("")).all(),
+            "Some audit log rows are missing box_id",
+        )
+
+    def test_csv_export_survives_restart(self):
+        """CSV export content must be identical after a simulated restart (reload)."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export
+
+        csv_before = build_csv_export(load_events())
+
+        csv_after = build_csv_export(load_events())
+
+        self.assertEqual(csv_before, csv_after)
+
+    def test_json_export_survives_restart(self):
+        """JSON export content must be identical after a simulated restart (reload)."""
+        events = self._create_events_with_audit_trail()
+        from app import build_json_export
+
+        json_before = json.dumps(build_json_export(load_events()), ensure_ascii=False, sort_keys=True)
+
+        json_after = json.dumps(build_json_export(load_events()), ensure_ascii=False, sort_keys=True)
+
+        self.assertEqual(json_before, json_after)
+
+    def test_csv_and_json_audit_logs_consistent(self):
+        """Audit log entries in CSV and JSON exports must be consistent in count and content."""
+        events = self._create_events_with_audit_trail()
+        from app import build_csv_export, build_json_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+        csv_audit_count = len(df[df["row_type"] == "审计日志"])
+
+        json_payload = build_json_export(load_events())
+        json_audit_count = len(json_payload["audit_logs"])
+
+        self.assertEqual(csv_audit_count, json_audit_count)
+
+        csv_audit_events = set(
+            df[df["row_type"] == "审计日志"]["event_id"].dropna().astype(str)
+        )
+        json_audit_events = set(l["event_id"] for l in json_payload["audit_logs"])
+        self.assertEqual(csv_audit_events, json_audit_events)
+
+    def test_csv_no_audit_log_for_events_without_changes(self):
+        """Events with no audit logs should only produce a single event row in CSV."""
+        events = []
+        for i in range(2):
+            event = AnomalyEvent(
+                box_id=f"BX-NOLOG-{i:03d}",
+                start_time=f"2025-06-10 0{i+8}:00:00",
+                end_time=f"2025-06-10 0{i+9}:00:00",
+                max_temperature=-10.0 - i,
+                duration_minutes=60,
+            )
+            events.append(event)
+        save_events(events)
+
+        from app import build_csv_export
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content))
+
+        event_rows = df[df["row_type"] == "事件"]
+        audit_rows = df[df["row_type"] == "审计日志"]
+        self.assertEqual(len(event_rows), 2)
+        self.assertEqual(len(audit_rows), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
