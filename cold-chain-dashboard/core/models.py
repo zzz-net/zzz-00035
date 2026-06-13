@@ -78,6 +78,10 @@ class AnomalyEvent:
     event_signature: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     evidence_ids: list = field(default_factory=list)
+    carrier_alert_count: int = 0
+    nearest_alert_time: str = ""
+    carrier: str = ""
+    alert_types: str = ""
 
     def to_dict(self):
         return asdict(self)

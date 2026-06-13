@@ -43,6 +43,10 @@ def _migrate_event_data(event_dict: dict) -> dict:
         "priority": Priority.MEDIUM.value,
         "last_updated_at": event_dict.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         "version": 1,
+        "carrier_alert_count": 0,
+        "nearest_alert_time": "",
+        "carrier": "",
+        "alert_types": "",
     }
     for key, default_value in defaults.items():
         if key not in event_dict:
@@ -441,6 +445,11 @@ def update_events_for_reanalysis(
                     matched_old = best_old
 
             if matched_old:
+                carrier_alert_count = new_ev.carrier_alert_count
+                nearest_alert_time = new_ev.nearest_alert_time
+                carrier = new_ev.carrier
+                alert_types = new_ev.alert_types
+
                 new_ev.event_id = matched_old.event_id
                 new_ev.status = matched_old.status
                 new_ev.handler = matched_old.handler
@@ -452,6 +461,12 @@ def update_events_for_reanalysis(
                 new_ev.priority = matched_old.priority
                 new_ev.last_updated_at = matched_old.last_updated_at
                 new_ev.version = matched_old.version
+
+                new_ev.carrier_alert_count = carrier_alert_count
+                new_ev.nearest_alert_time = nearest_alert_time
+                new_ev.carrier = carrier
+                new_ev.alert_types = alert_types
+
                 new_event_ids_map[sig] = matched_old.event_id
                 matched_old_event_ids.add(matched_old.event_id)
                 updated += 1

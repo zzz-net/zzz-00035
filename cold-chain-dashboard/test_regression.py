@@ -64,6 +64,10 @@ class TestBase(unittest.TestCase):
                 "skip_invalid_timestamp_rows": True,
                 "reject_duplicate_batch": True,
             },
+            "carrier_alert": {
+                "pre_window_minutes": 30,
+                "post_window_minutes": 30,
+            },
             "export": {"default_encoding": "utf-8-sig"},
         }
 
@@ -205,7 +209,7 @@ class TestReimportAndReanalysis(TestBase):
             raw_data_hash=raw_data_hash, config_signature=config_sig,
         )
         receipt_evidence = link_receipt_evidence(events, receipt_df, "batch-v1", "receipt.csv")
-        alert_evidence = link_alert_evidence(events, alerts, "batch-v1", "alerts.json")
+        alert_evidence = link_alert_evidence(events, alerts, "batch-v1", "alerts.json", self.config)
 
         batch = ImportBatch(
             batch_id="batch-v1",
@@ -1335,9 +1339,14 @@ class TestCsvExportAuditLog(TestBase):
         events = self._create_events_with_audit_trail()
         from app import build_json_export
 
-        json_before = json.dumps(build_json_export(load_events()), ensure_ascii=False, sort_keys=True)
+        payload_before = build_json_export(load_events())
+        payload_after = build_json_export(load_events())
 
-        json_after = json.dumps(build_json_export(load_events()), ensure_ascii=False, sort_keys=True)
+        payload_before.pop("export_time", None)
+        payload_after.pop("export_time", None)
+
+        json_before = json.dumps(payload_before, ensure_ascii=False, sort_keys=True)
+        json_after = json.dumps(payload_after, ensure_ascii=False, sort_keys=True)
 
         self.assertEqual(json_before, json_after)
 
@@ -1911,6 +1920,446 @@ class TestAuditLogTimestampConsistency(TestBase):
                 log["field_changed"], field_order[i],
                 f"Log {i} field_changed mismatch: expected {field_order[i]}, got {log['field_changed']}",
             )
+
+
+class TestCarrierAlertWindowConfig(TestBase):
+    """Test carrier alert time window configuration changes affect config hash."""
+
+    def test_config_hash_changes_with_pre_window(self):
+        """Config hash should change when pre_window_minutes changes."""
+        h1 = compute_config_hash(self.config)
+
+        self.config["carrier_alert"]["pre_window_minutes"] = 60
+        h2 = compute_config_hash(self.config)
+        self.assertNotEqual(h1, h2)
+
+    def test_config_hash_changes_with_post_window(self):
+        """Config hash should change when post_window_minutes changes."""
+        h1 = compute_config_hash(self.config)
+
+        self.config["carrier_alert"]["post_window_minutes"] = 60
+        h2 = compute_config_hash(self.config)
+        self.assertNotEqual(h1, h2)
+
+    def test_default_carrier_alert_fields_on_new_event(self):
+        """New events should have default carrier alert fields set correctly."""
+        event = AnomalyEvent(box_id="BX-TEST", start_time="2025-06-10 08:00:00", end_time="2025-06-10 09:00:00")
+        self.assertEqual(event.carrier_alert_count, 0)
+        self.assertEqual(event.nearest_alert_time, "")
+        self.assertEqual(event.carrier, "")
+        self.assertEqual(event.alert_types, "")
+
+
+class TestCarrierAlertMatching(TestBase):
+    """Test carrier alert matching logic against time windows."""
+
+    def test_alerts_matched_within_default_window(self):
+        """Alerts within default 30min pre/post window should be matched."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts = parse_carrier_alerts(self.alert_json_content.encode())
+        valid_rows, _ = validate_temperature_rows(df, self.config, batch_id="batch-match")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, _ = generate_events(
+            valid_rows, self.config, "batch-match", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        alert_evidence = link_alert_evidence(events, alerts, "batch-match", "alerts.json", self.config)
+
+        bx001_events = [e for e in events if e.box_id == "BX-001"]
+        self.assertGreater(len(bx001_events), 0)
+        bx001_event = bx001_events[0]
+        self.assertGreaterEqual(bx001_event.carrier_alert_count, 1)
+        self.assertEqual(bx001_event.carrier, "顺丰冷链")
+        self.assertEqual(bx001_event.alert_types, "temperature_exceeded")
+        self.assertNotEqual(bx001_event.nearest_alert_time, "")
+
+    def test_alerts_outside_window_not_matched(self):
+        """Alerts outside the time window should NOT be matched."""
+        tight_config = self.config.copy()
+        tight_config["carrier_alert"] = {"pre_window_minutes": 0, "post_window_minutes": 0}
+
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts_far = json.dumps([
+            {"carrier": "顺丰冷链", "alert_time": "2025-06-10 06:00:00", "box_id": "BX-001", "alert_type": "temperature_exceeded", "message": "too early"},
+            {"carrier": "顺丰冷链", "alert_time": "2025-06-10 10:00:00", "box_id": "BX-001", "alert_type": "temperature_exceeded", "message": "too late"},
+        ]).encode()
+        alerts = parse_carrier_alerts(alerts_far)
+        valid_rows, _ = validate_temperature_rows(df, tight_config, batch_id="batch-tight")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(tight_config)
+
+        events, _ = generate_events(
+            valid_rows, tight_config, "batch-tight", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        link_alert_evidence(events, alerts, "batch-tight", "alerts.json", tight_config)
+
+        bx001_events = [e for e in events if e.box_id == "BX-001"]
+        self.assertGreater(len(bx001_events), 0)
+        for e in bx001_events:
+            self.assertEqual(e.carrier_alert_count, 0)
+            self.assertEqual(e.nearest_alert_time, "")
+            self.assertEqual(e.carrier, "")
+            self.assertEqual(e.alert_types, "")
+
+    def test_multiple_alerts_same_box_aggregated(self):
+        """Multiple alerts for same box should be aggregated correctly."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts_multi = json.dumps([
+            {"carrier": "京东冷链", "alert_time": "2025-06-10 11:12:00", "box_id": "BX-004", "alert_type": "temperature_exceeded", "message": "msg1"},
+            {"carrier": "京东冷链", "alert_time": "2025-06-10 11:22:00", "box_id": "BX-004", "alert_type": "equipment_fault", "message": "msg2"},
+            {"carrier": "顺丰冷链", "alert_time": "2025-06-10 11:15:00", "box_id": "BX-004", "alert_type": "temperature_exceeded", "message": "msg3"},
+        ]).encode()
+        alerts = parse_carrier_alerts(alerts_multi)
+        valid_rows, _ = validate_temperature_rows(df, self.config, batch_id="batch-multi")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, _ = generate_events(
+            valid_rows, self.config, "batch-multi", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        link_alert_evidence(events, alerts, "batch-multi", "alerts.json", self.config)
+
+        bx004_events = [e for e in events if e.box_id == "BX-004"]
+        self.assertGreater(len(bx004_events), 0)
+        bx004_event = bx004_events[0]
+        self.assertEqual(bx004_event.carrier_alert_count, 3)
+        self.assertEqual(bx004_event.carrier, "京东冷链,顺丰冷链")
+        self.assertEqual(bx004_event.alert_types, "equipment_fault,temperature_exceeded")
+
+    def test_events_without_matching_alerts(self):
+        """Events without any carrier alert should have zero/default fields."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, _ = validate_temperature_rows(df, self.config, batch_id="batch-noalert")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, _ = generate_events(
+            valid_rows, self.config, "batch-noalert", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        link_alert_evidence(events, [], "batch-noalert", "alerts.json", self.config)
+
+        bx002_events = [e for e in events if e.box_id == "BX-002"]
+        self.assertGreater(len(bx002_events), 0)
+        bx002_event = bx002_events[0]
+        self.assertEqual(bx002_event.carrier_alert_count, 0)
+        self.assertEqual(bx002_event.nearest_alert_time, "")
+        self.assertEqual(bx002_event.carrier, "")
+        self.assertEqual(bx002_event.alert_types, "")
+
+
+class TestCarrierAlertReanalysis(TestBase):
+    """Test re-analysis preserves review data but updates carrier alert fields."""
+
+    def _import_with_alerts_content(self, config, batch_id, alert_json_content):
+        """Helper: import temp + custom alerts and return events + raw_data_hash."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts = parse_carrier_alerts(alert_json_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(config)
+        events, temp_evidence = generate_events(
+            valid_rows, config, batch_id, "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        receipt_df = parse_receipt_csv(self.receipt_csv_content.encode())
+        receipt_evidence = link_receipt_evidence(events, receipt_df, batch_id, "receipt.csv")
+        alert_evidence = link_alert_evidence(events, alerts, batch_id, "alerts.json", config)
+        batch = ImportBatch(
+            batch_id=batch_id, file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence + receipt_evidence + alert_evidence, batch, skipped_logs)
+        return events, raw_data_hash, valid_rows
+
+    def test_reanalysis_updates_alert_fields_but_preserves_review(self):
+        """Re-analysis with wider window should update alert fields but keep review status."""
+        tight_config = self.config.copy()
+        tight_config["carrier_alert"] = {"pre_window_minutes": 0, "post_window_minutes": 0}
+
+        alerts_outside_window = json.dumps([
+            {"carrier": "顺丰冷链", "alert_time": "2025-06-10 05:00:00", "box_id": "BX-001", "alert_type": "equipment_fault", "message": "告警在事件窗口外"},
+        ])
+
+        events_v1, raw_data_hash, valid_rows = self._import_with_alerts_content(
+            tight_config, "batch-v1", alerts_outside_window
+        )
+
+        bx001_events = [e for e in events_v1 if e.box_id == "BX-001"]
+        self.assertGreater(len(bx001_events), 0)
+        target_event = bx001_events[0]
+        self.assertEqual(target_event.carrier_alert_count, 0)
+
+        update_event(
+            event_id=target_event.event_id, status=EventStatus.CONFIRMED.value,
+            handler="测试员", remark="确认超温",
+        )
+        update_event_assignment(
+            target_event.event_id, "早班A", "2025-06-11 18:00:00",
+            Priority.HIGH.value, "主管", "紧急处理",
+        )
+
+        ev_before = get_event_by_id(target_event.event_id)
+        self.assertEqual(ev_before.status, EventStatus.CONFIRMED.value)
+        self.assertEqual(ev_before.handler, "测试员")
+        self.assertEqual(ev_before.assignee, "早班A")
+        self.assertEqual(ev_before.carrier_alert_count, 0)
+        audit_count_before = len(get_audit_logs_for_event(target_event.event_id))
+        non_temp_evidence_before = [
+            e for e in get_evidence_for_event(target_event.event_id)
+            if e.evidence_type != "温度记录"
+        ]
+
+        wide_config = self.config.copy()
+        wide_config["carrier_alert"] = {"pre_window_minutes": 60, "post_window_minutes": 60}
+        new_config_sig = compute_config_hash(wide_config)
+
+        new_events, new_temp_evidence = generate_events(
+            valid_rows, wide_config, "batch-v2", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=new_config_sig,
+        )
+        alerts = parse_carrier_alerts(self.alert_json_content.encode())
+        link_alert_evidence(new_events, alerts, "batch-v2", "alerts.json", wide_config)
+
+        batch_v2 = ImportBatch(
+            batch_id="batch-v2", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=new_config_sig,
+            row_count=23, skipped_rows=2, status="成功", is_reanalysis=True,
+        )
+        update_events_for_reanalysis(new_events, new_temp_evidence, batch_v2, [])
+
+        ev_after = get_event_by_id(target_event.event_id)
+        self.assertEqual(ev_after.status, EventStatus.CONFIRMED.value)
+        self.assertEqual(ev_after.handler, "测试员")
+        self.assertEqual(ev_after.handler_remark, "确认超温")
+        self.assertEqual(ev_after.assignee, "早班A")
+        self.assertEqual(ev_after.priority, Priority.HIGH.value)
+        self.assertEqual(ev_after.version, ev_before.version)
+
+        audit_count_after = len(get_audit_logs_for_event(target_event.event_id))
+        self.assertEqual(audit_count_after, audit_count_before)
+
+        non_temp_evidence_after = [
+            e for e in get_evidence_for_event(target_event.event_id)
+            if e.evidence_type != "温度记录"
+        ]
+        self.assertEqual(len(non_temp_evidence_after), len(non_temp_evidence_before))
+
+        bx001_after = next(e for e in load_events() if e.box_id == "BX-001")
+        self.assertGreaterEqual(bx001_after.carrier_alert_count, 1)
+        self.assertNotEqual(bx001_after.carrier, "")
+
+
+class TestCarrierAlertRestartPersistence(TestBase):
+    """Test carrier alert fields survive save/load cycles (simulated restart)."""
+
+    def test_carrier_alert_fields_survive_restart(self):
+        """Carrier alert fields should persist after save and reload."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts = parse_carrier_alerts(self.alert_json_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-restart")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-restart", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        alert_evidence = link_alert_evidence(events, alerts, "batch-restart", "alerts.json", self.config)
+        batch = ImportBatch(
+            batch_id="batch-restart", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence + alert_evidence, batch, skipped_logs)
+
+        events_before = load_events()
+        before_map = {e.event_id: e for e in events_before}
+
+        events_after = load_events()
+        after_map = {e.event_id: e for e in events_after}
+
+        for eid in before_map:
+            self.assertEqual(before_map[eid].carrier_alert_count, after_map[eid].carrier_alert_count)
+            self.assertEqual(before_map[eid].nearest_alert_time, after_map[eid].nearest_alert_time)
+            self.assertEqual(before_map[eid].carrier, after_map[eid].carrier)
+            self.assertEqual(before_map[eid].alert_types, after_map[eid].alert_types)
+
+
+class TestCarrierAlertExportConsistency(TestBase):
+    """Test CSV and JSON exports include carrier alert fields correctly."""
+
+    def _create_events_with_alerts(self):
+        """Helper: create events both with and without carrier alerts."""
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        alerts = parse_carrier_alerts(self.alert_json_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-export")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-export", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        alert_evidence = link_alert_evidence(events, alerts, "batch-export", "alerts.json", self.config)
+        batch = ImportBatch(
+            batch_id="batch-export", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence + alert_evidence, batch, skipped_logs)
+        return events
+
+    def test_csv_export_includes_carrier_alert_columns(self):
+        """CSV export should include all carrier alert columns."""
+        self._create_events_with_alerts()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        required_cols = ["carrier_alert_count", "nearest_alert_time", "carrier", "alert_types", "has_carrier_alert"]
+        for col in required_cols:
+            self.assertIn(col, df.columns, f"CSV missing column: {col}")
+
+    def test_csv_export_values_correct_for_alert_events(self):
+        """CSV should have correct carrier alert values for events WITH alerts."""
+        events = self._create_events_with_alerts()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        event_rows = df[df["row_type"] == "事件"]
+
+        with_alerts = event_rows[event_rows["carrier_alert_count"].astype(int) > 0]
+        self.assertGreater(len(with_alerts), 0, "No events with carrier alerts in CSV")
+
+        for _, row in with_alerts.iterrows():
+            self.assertNotEqual(str(row["carrier"]).strip(), "", "carrier should not be empty for matched events")
+            self.assertNotEqual(str(row["alert_types"]).strip(), "", "alert_types should not be empty")
+            self.assertNotEqual(str(row["nearest_alert_time"]).strip(), "", "nearest_alert_time should not be empty")
+            self.assertEqual(str(row["has_carrier_alert"]).strip(), "True")
+
+    def test_csv_export_values_correct_for_no_alert_events(self):
+        """CSV should have zero/empty carrier alert values for events WITHOUT alerts."""
+        self._create_events_with_alerts()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        event_rows = df[df["row_type"] == "事件"]
+
+        without_alerts = event_rows[event_rows["carrier_alert_count"].astype(int) == 0]
+        self.assertGreater(len(without_alerts), 0, "No events without carrier alerts in CSV")
+
+        for _, row in without_alerts.iterrows():
+            self.assertEqual(str(row["carrier"]).strip(), "")
+            self.assertEqual(str(row["alert_types"]).strip(), "")
+            self.assertEqual(str(row["nearest_alert_time"]).strip(), "")
+            self.assertEqual(str(row["has_carrier_alert"]).strip(), "False")
+
+    def test_json_export_includes_carrier_alert_fields(self):
+        """JSON export should include all carrier alert fields."""
+        self._create_events_with_alerts()
+        from app import build_json_export
+
+        payload = build_json_export(load_events())
+        required_keys = ["carrier_alert_count", "nearest_alert_time", "carrier", "alert_types", "has_carrier_alert"]
+
+        for ev in payload["events"]:
+            for key in required_keys:
+                self.assertIn(key, ev, f"JSON event missing field: {key}")
+
+    def test_csv_and_json_alert_values_consistent(self):
+        """Carrier alert values should match between CSV and JSON for same event."""
+        events = self._create_events_with_alerts()
+        from app import build_csv_export, build_json_export
+
+        filtered = load_events()
+        csv_df = pd.read_csv(io.StringIO(build_csv_export(filtered)), keep_default_na=False)
+        json_payload = build_json_export(filtered)
+
+        csv_event_rows = csv_df[csv_df["row_type"] == "事件"]
+        json_events_by_id = {e["event_id"]: e for e in json_payload["events"]}
+
+        for _, csv_row in csv_event_rows.iterrows():
+            eid = csv_row["event_id"]
+            self.assertIn(eid, json_events_by_id)
+            json_ev = json_events_by_id[eid]
+
+            self.assertEqual(int(csv_row["carrier_alert_count"]), json_ev["carrier_alert_count"])
+            self.assertEqual(str(csv_row["nearest_alert_time"]), str(json_ev.get("nearest_alert_time", "")))
+            self.assertEqual(str(csv_row["carrier"]), str(json_ev.get("carrier", "")))
+            self.assertEqual(str(csv_row["alert_types"]), str(json_ev.get("alert_types", "")))
+            self.assertEqual(str(csv_row["has_carrier_alert"]).lower() == "true", bool(json_ev["has_carrier_alert"]))
+
+
+class TestCarrierAlertDataMigration(TestBase):
+    """Test old event data gets carrier alert fields with default values."""
+
+    def test_old_event_migrated_with_carrier_alert_defaults(self):
+        """Events without carrier alert fields should be migrated with zeros/empty strings."""
+        old_event_data = {
+            "event_id": "test-old-carrier-001",
+            "box_id": "BX-OLD",
+            "start_time": "2025-06-10 08:00:00",
+            "end_time": "2025-06-10 09:00:00",
+            "max_temperature": -10.0,
+            "duration_minutes": 60,
+            "status": EventStatus.PENDING.value,
+            "handler": "",
+            "handler_remark": "",
+            "close_time": "",
+            "batch_id": "batch-old",
+            "raw_data_hash": "oldhash",
+            "config_signature": "oldsig",
+            "event_signature": "oldeventsig",
+            "created_at": "2025-06-10 10:00:00",
+            "evidence_ids": [],
+        }
+
+        import json
+        from core.persistence import _EVENTS_FILE, _ensure_dir
+        _ensure_dir()
+        with open(_EVENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump([old_event_data], f, ensure_ascii=False, indent=2)
+
+        loaded = load_events()
+        self.assertEqual(len(loaded), 1)
+        ev = loaded[0]
+        self.assertEqual(ev.event_id, "test-old-carrier-001")
+        self.assertEqual(ev.carrier_alert_count, 0)
+        self.assertEqual(ev.nearest_alert_time, "")
+        self.assertEqual(ev.carrier, "")
+        self.assertEqual(ev.alert_types, "")
+
+
+class TestCarrierAlertFilterSemantics(TestBase):
+    """Test 'has alert' / 'no alert' filter semantics match spec."""
+
+    def test_has_alert_is_count_gt_zero(self):
+        """has_carrier_alert should be True exactly when carrier_alert_count > 0."""
+        events_with = AnomalyEvent(box_id="BX-WITH", start_time="2025-06-10 08:00:00", end_time="2025-06-10 09:00:00")
+        events_with.carrier_alert_count = 2
+
+        events_without = AnomalyEvent(box_id="BX-WITHOUT", start_time="2025-06-10 08:00:00", end_time="2025-06-10 09:00:00")
+        events_without.carrier_alert_count = 0
+
+        events_zero = AnomalyEvent(box_id="BX-ZERO", start_time="2025-06-10 08:00:00", end_time="2025-06-10 09:00:00")
+        events_zero.carrier_alert_count = 0
+
+        self.assertTrue(events_with.carrier_alert_count > 0)
+        self.assertFalse(events_without.carrier_alert_count > 0)
+        self.assertFalse(events_zero.carrier_alert_count > 0)
 
 
 if __name__ == "__main__":

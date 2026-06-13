@@ -17,11 +17,14 @@ def compute_file_hash(content: bytes) -> str:
 
 def compute_config_hash(config: dict) -> str:
     thresholds = config.get("thresholds", {})
+    carrier_alert = config.get("carrier_alert", {})
     key = (
         float(thresholds.get("temperature_upper_limit", 0)),
         int(thresholds.get("continuous_over_temp_minutes", 0)),
         int(thresholds.get("breakpoint_interval_minutes", 0)),
         int(thresholds.get("merge_window_minutes", 0)),
+        int(carrier_alert.get("pre_window_minutes", 0)),
+        int(carrier_alert.get("post_window_minutes", 0)),
     )
     return hashlib.sha256(repr(key).encode()).hexdigest()[:16]
 
@@ -274,11 +277,19 @@ def link_receipt_evidence(
     return evidences
 
 
+def _parse_ts(ts_str: str):
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
 def link_alert_evidence(
     events: list[AnomalyEvent],
     alerts: list,
     batch_id: str,
     source_file: str,
+    config: dict,
 ) -> list:
     evidences = []
     alert_map: dict[str, list] = {}
@@ -287,9 +298,51 @@ def link_alert_evidence(
         if bid:
             alert_map.setdefault(bid, []).append(a)
 
+    carrier_config = config.get("carrier_alert", {})
+    pre_window = timedelta(minutes=int(carrier_config.get("pre_window_minutes", 30)))
+    post_window = timedelta(minutes=int(carrier_config.get("post_window_minutes", 30)))
+
     for ev in events:
+        event_start = _parse_ts(ev.start_time)
+        event_end = _parse_ts(ev.end_time)
+        if not event_start or not event_end:
+            continue
+
+        window_start = event_start - pre_window
+        window_end = event_end + post_window
+
+        matched_alerts = []
         als = alert_map.get(ev.box_id, [])
         for a in als:
+            alert_time = _parse_ts(str(a.get("alert_time", "")))
+            if alert_time and window_start <= alert_time <= window_end:
+                matched_alerts.append(a)
+
+        if matched_alerts:
+            ev.carrier_alert_count = len(matched_alerts)
+
+            nearest_alert = None
+            min_diff = None
+            carriers = set()
+            alert_types_set = set()
+
+            for a in matched_alerts:
+                alert_time = _parse_ts(str(a.get("alert_time", "")))
+                carriers.add(str(a.get("carrier", "")))
+                alert_types_set.add(str(a.get("alert_type", "")))
+
+                diff = abs((alert_time - event_start).total_seconds())
+                if min_diff is None or diff < min_diff:
+                    min_diff = diff
+                    nearest_alert = a
+
+            if nearest_alert:
+                ev.nearest_alert_time = str(nearest_alert.get("alert_time", ""))
+
+            ev.carrier = ",".join(sorted(c for c in carriers if c))
+            ev.alert_types = ",".join(sorted(t for t in alert_types_set if t))
+
+        for a in matched_alerts:
             e = Evidence(
                 event_id=ev.event_id,
                 evidence_type=EvidenceType.CARRIER_ALERT.value,

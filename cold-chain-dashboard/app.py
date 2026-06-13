@@ -104,6 +104,7 @@ def build_csv_export(events: list) -> str:
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
         event_dict["row_type"] = "事件"
+        event_dict["has_carrier_alert"] = e.carrier_alert_count > 0
         csv_rows.append(event_dict)
 
         for log in get_audit_logs_for_event(e.event_id):
@@ -126,7 +127,9 @@ def build_csv_export(events: list) -> str:
         "row_type", "event_id", "box_id",
         "status", "priority", "assignee", "deadline",
         "is_overdue", "overdue_status", "start_time", "end_time",
-        "max_temperature", "duration_minutes", "handler", "handler_remark",
+        "max_temperature", "duration_minutes",
+        "carrier_alert_count", "nearest_alert_time", "carrier", "alert_types", "has_carrier_alert",
+        "handler", "handler_remark",
         "close_time", "last_updated_at", "version", "created_at",
         "log_id", "action", "field_changed", "old_value", "new_value",
         "operator", "log_timestamp", "remark",
@@ -146,6 +149,7 @@ def build_json_export(events: list) -> dict:
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
+        event_dict["has_carrier_alert"] = e.carrier_alert_count > 0
         export_events.append(event_dict)
 
     evidence_data = []
@@ -242,12 +246,12 @@ if menu == "数据导入":
                     except Exception as e:
                         st.warning(f"收货备注解析失败: {e}")
 
-                if alert_file and not is_reanalysis:
+                if alert_file:
                     try:
                         alert_content = alert_file.read()
                         alerts = parse_carrier_alerts(alert_content)
                         alert_evidence = link_alert_evidence(
-                            events, alerts, batch_id, alert_file.name
+                            events, alerts, batch_id, alert_file.name, cfg
                         )
                     except Exception as e:
                         st.warning(f"承运商告警解析失败: {e}")
@@ -303,7 +307,16 @@ elif menu == "异常事件看板":
             [s.value for s in EventStatus],
             default=[s.value for s in EventStatus],
         )
+        alert_filter = st.selectbox(
+            "按承运商告警筛选",
+            ["全部", "有承运商告警", "无承运商告警"],
+            index=0,
+        )
         filtered = [e for e in events if e.status in status_filter]
+        if alert_filter == "有承运商告警":
+            filtered = [e for e in filtered if e.carrier_alert_count > 0]
+        elif alert_filter == "无承运商告警":
+            filtered = [e for e in filtered if e.carrier_alert_count == 0]
 
         col_a, col_b, col_c, col_d = st.columns(4)
         counts = {s.value: 0 for s in EventStatus}
@@ -314,6 +327,12 @@ elif menu == "异常事件看板":
         col_c.metric("误报", counts.get("误报", 0))
         col_d.metric("已关闭", counts.get("已关闭", 0))
 
+        col_e, col_f = st.columns(2)
+        with_alerts = sum(1 for e in events if e.carrier_alert_count > 0)
+        without_alerts = sum(1 for e in events if e.carrier_alert_count == 0)
+        col_e.metric("有承运商告警", with_alerts)
+        col_f.metric("无承运商告警", without_alerts)
+
         st.markdown("---")
 
         if not filtered:
@@ -322,9 +341,15 @@ elif menu == "异常事件看板":
             rows = []
             for e in filtered:
                 overdue = _is_overdue(e.deadline)
+                has_alert = "⚠️ 有告警" if e.carrier_alert_count > 0 else "✅ 无告警"
                 rows.append({
                     "状态": _status_color(e.status),
                     "优先级": _priority_color(e.priority),
+                    "承运商告警": has_alert,
+                    "告警数量": e.carrier_alert_count,
+                    "最近告警时间": e.nearest_alert_time,
+                    "承运商": e.carrier,
+                    "告警类型": e.alert_types,
                     "事件ID": e.event_id,
                     "箱号": e.box_id,
                     "开始时间": e.start_time,
@@ -340,9 +365,10 @@ elif menu == "异常事件看板":
                 })
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True, hide_index=True, column_order=[
-                "状态", "优先级", "事件ID", "箱号", "开始时间", "最高温度(°C)",
-                "持续(分钟)", "状态值", "优先级值", "责任人", "截止时间",
-                "是否逾期", "处理人", "最后更新"
+                "状态", "优先级", "承运商告警", "告警数量", "最近告警时间",
+                "承运商", "告警类型", "事件ID", "箱号", "开始时间",
+                "最高温度(°C)", "持续(分钟)", "状态值", "优先级值",
+                "责任人", "截止时间", "是否逾期", "处理人", "最后更新"
             ])
 
         selected = st.text_input("输入事件ID查看详情和证据")
@@ -350,6 +376,13 @@ elif menu == "异常事件看板":
             ev = next((e for e in events if e.event_id == selected), None)
             if ev:
                 st.subheader(f"事件 {ev.event_id} 详情")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**承运商告警数量:** {ev.carrier_alert_count}")
+                    st.markdown(f"**最近告警时间:** {ev.nearest_alert_time or '无'}")
+                with col2:
+                    st.markdown(f"**承运商:** {ev.carrier or '无'}")
+                    st.markdown(f"**告警类型:** {ev.alert_types or '无'}")
                 st.json(ev.to_dict())
                 ev_list = get_evidence_for_event(ev.event_id)
                 if ev_list:
@@ -378,7 +411,7 @@ elif menu == "事件复核":
         all_assignees = sorted(set([e.assignee for e in pending_or_confirmed if e.assignee]))
         all_statuses = sorted(set([e.status for e in pending_or_confirmed]))
 
-        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        col_filter1, col_filter2, col_filter3, col_filter4 = st.columns(4)
         with col_filter1:
             filter_assignee = st.multiselect(
                 "按责任人筛选",
@@ -397,6 +430,12 @@ elif menu == "事件复核":
                 ["全部", "已逾期", "未逾期"],
                 index=0,
             )
+        with col_filter4:
+            filter_alert = st.selectbox(
+                "按承运商告警筛选",
+                ["全部", "有承运商告警", "无承运商告警"],
+                index=0,
+            )
 
         filtered = pending_or_confirmed
         if filter_assignee:
@@ -407,6 +446,10 @@ elif menu == "事件复核":
             filtered = [e for e in filtered if _is_overdue(e.deadline)]
         elif filter_overdue == "未逾期":
             filtered = [e for e in filtered if not _is_overdue(e.deadline)]
+        if filter_alert == "有承运商告警":
+            filtered = [e for e in filtered if e.carrier_alert_count > 0]
+        elif filter_alert == "无承运商告警":
+            filtered = [e for e in filtered if e.carrier_alert_count == 0]
 
         st.markdown("---")
         if not filtered:
@@ -416,9 +459,12 @@ elif menu == "事件复核":
             rows = []
             for e in filtered:
                 overdue = _is_overdue(e.deadline)
+                has_alert = "⚠️ 有告警" if e.carrier_alert_count > 0 else "✅ 无告警"
                 rows.append({
                     "状态": _status_color(e.status),
                     "优先级": _priority_color(e.priority),
+                    "承运商告警": has_alert,
+                    "告警数量": e.carrier_alert_count,
                     "事件ID": e.event_id,
                     "箱号": e.box_id,
                     "开始时间": e.start_time,
@@ -433,8 +479,9 @@ elif menu == "事件复核":
                 })
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True, hide_index=True, column_order=[
-                "状态", "优先级", "事件ID", "箱号", "开始时间", "最高温度(°C)",
-                "持续(分钟)", "责任人", "截止时间", "是否逾期", "最后更新"
+                "状态", "优先级", "承运商告警", "告警数量", "事件ID", "箱号",
+                "开始时间", "最高温度(°C)", "持续(分钟)", "责任人",
+                "截止时间", "是否逾期", "最后更新"
             ])
 
         st.markdown("---")
@@ -589,6 +636,14 @@ elif menu == "阈值配置":
     new_bp = st.number_input("断点间隔 (分钟)", value=int(thresholds.get("breakpoint_interval_minutes", 10)), min_value=1)
     new_merge = st.number_input("合并窗口 (分钟)", value=int(thresholds.get("merge_window_minutes", 30)), min_value=1)
 
+    st.markdown("---")
+    st.subheader("承运商告警匹配窗口")
+    st.markdown("用于匹配承运商告警与超温事件的时间窗口设置。")
+    carrier_alert = cfg.get("carrier_alert", {})
+    new_pre_window = st.number_input("事件前窗口 (分钟)", value=int(carrier_alert.get("pre_window_minutes", 30)), min_value=0, help="超温事件开始前多少分钟内的告警计入匹配")
+    new_post_window = st.number_input("事件后窗口 (分钟)", value=int(carrier_alert.get("post_window_minutes", 30)), min_value=0, help="超温事件结束后多少分钟内的告警计入匹配")
+
+    st.markdown("---")
     validation = cfg.get("validation", {})
     new_allow_missing = st.checkbox("允许缺箱号", value=validation.get("allow_missing_box_id", True))
     new_skip_bad_ts = st.checkbox("跳过时间解析失败行", value=validation.get("skip_invalid_timestamp_rows", True))
@@ -600,6 +655,8 @@ elif menu == "阈值配置":
             int(new_cont)
             int(new_bp)
             int(new_merge)
+            int(new_pre_window)
+            int(new_post_window)
         except (ValueError, TypeError):
             st.error("⚠️ 阈值配置错误: 请确保所有数值有效")
         else:
@@ -608,6 +665,10 @@ elif menu == "阈值配置":
                 "continuous_over_temp_minutes": int(new_cont),
                 "breakpoint_interval_minutes": int(new_bp),
                 "merge_window_minutes": int(new_merge),
+            }
+            cfg["carrier_alert"] = {
+                "pre_window_minutes": int(new_pre_window),
+                "post_window_minutes": int(new_post_window),
             }
             cfg["validation"] = {
                 "allow_missing_box_id": new_allow_missing,
