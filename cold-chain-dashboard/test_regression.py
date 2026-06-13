@@ -1635,5 +1635,283 @@ class TestCsvExportMisreadRisk(TestBase):
         self.assertGreaterEqual(len(audit_rows), 6)  # 2*(a/d/p) + status + handler...
 
 
+class TestAuditLogTimestampConsistency(TestBase):
+    """Regression test for the audit log timestamp field name mismatch between CSV and JSON.
+
+    Bug: README said JSON audit_logs fields match CSV completely, and downstream reads
+    'log_timestamp' for operation time. But JSON was outputting 'timestamp' (the internal
+    model field name), while CSV correctly used 'log_timestamp'.
+
+    Fix: build_json_export now renames 'timestamp' to 'log_timestamp' for audit logs,
+    matching CSV and README.
+    """
+
+    def _create_events_with_operations(self):
+        """Create events with assignment, deadline, and priority changes."""
+        events = []
+        for i in range(2):
+            event = AnomalyEvent(
+                box_id=f"BX-TSTAMP-{i:03d}",
+                start_time=f"2025-06-10 0{i+8}:00:00",
+                end_time=f"2025-06-10 0{i+9}:00:00",
+                max_temperature=-10.0 - i,
+                duration_minutes=60,
+                status=EventStatus.PENDING.value,
+            )
+            events.append(event)
+        save_events(events)
+
+        update_event_assignment(
+            events[0].event_id, "早班A", "2025-06-11 18:00:00",
+            Priority.HIGH.value, "主管甲", "第一次分派",
+        )
+        update_event_assignment(
+            events[0].event_id, "早班B", "2025-06-12 12:00:00",
+            Priority.URGENT.value, "主管乙", "改期并升级优先级",
+        )
+        update_event(
+            events[0].event_id, EventStatus.CONFIRMED.value,
+            "处理员A", "确认超温，已通知仓库",
+        )
+        return events
+
+    def test_csv_audit_log_has_log_timestamp_column(self):
+        """CSV audit log rows must have 'log_timestamp' column with valid timestamps."""
+        events = self._create_events_with_operations()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        self.assertIn("log_timestamp", df.columns, "CSV missing 'log_timestamp' column")
+
+        audit_rows = df[df["row_type"] == "审计日志"]
+        self.assertGreater(len(audit_rows), 0)
+
+        timestamps = audit_rows["log_timestamp"].dropna().astype(str)
+        non_empty = timestamps[timestamps.ne("")]
+        self.assertEqual(
+            len(non_empty), len(audit_rows),
+            "Some CSV audit log rows have empty log_timestamp",
+        )
+
+        for ts in non_empty:
+            self.assertRegex(
+                ts, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                f"CSV log_timestamp '{ts}' has wrong format",
+            )
+
+    def test_json_audit_log_has_log_timestamp_field(self):
+        """JSON audit_logs must have 'log_timestamp' field (not 'timestamp')."""
+        events = self._create_events_with_operations()
+        from app import build_json_export
+
+        json_payload = build_json_export(load_events())
+        audit_logs = json_payload["audit_logs"]
+
+        self.assertGreater(len(audit_logs), 0)
+
+        for log in audit_logs:
+            self.assertIn(
+                "log_timestamp", log,
+                "JSON audit_logs missing 'log_timestamp' field; "
+                "downstream reads this to get operation time",
+            )
+            self.assertNotIn(
+                "timestamp", log,
+                "JSON audit_logs still has old 'timestamp' field; "
+                "should be renamed to 'log_timestamp'",
+            )
+            self.assertRegex(
+                log["log_timestamp"],
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                f"JSON log_timestamp '{log['log_timestamp']}' has wrong format",
+            )
+
+    def test_csv_and_json_audit_timestamps_match(self):
+        """Audit log timestamps must be identical between CSV and JSON for same log_id."""
+        events = self._create_events_with_operations()
+        from app import build_csv_export, build_json_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        csv_audits = df[df["row_type"] == "审计日志"]
+
+        json_payload = build_json_export(load_events())
+        json_audits = {log["log_id"]: log for log in json_payload["audit_logs"]}
+
+        self.assertEqual(len(csv_audits), len(json_audits))
+
+        for _, csv_row in csv_audits.iterrows():
+            log_id = csv_row["log_id"]
+            self.assertIn(log_id, json_audits, f"Log {log_id} missing from JSON")
+            json_log = json_audits[log_id]
+            self.assertEqual(
+                csv_row["log_timestamp"], json_log["log_timestamp"],
+                f"Timestamp mismatch for log {log_id}: "
+                f"CSV='{csv_row['log_timestamp']}', JSON='{json_log['log_timestamp']}'",
+            )
+
+    def test_downstream_can_read_operation_time_by_log_timestamp(self):
+        """Simulate downstream reading operation time by 'log_timestamp' —
+        this must work for both CSV and JSON, for all operation types:
+        assignment, deadline change, priority adjustment, status change.
+        """
+        events = self._create_events_with_operations()
+        from app import build_csv_export, build_json_export
+
+        target_event_id = events[0].event_id
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        csv_audits = df[
+            (df["row_type"] == "审计日志") &
+            (df["event_id"] == target_event_id)
+        ]
+
+        json_payload = build_json_export(load_events())
+        json_audits = [
+            log for log in json_payload["audit_logs"]
+            if log["event_id"] == target_event_id
+        ]
+
+        field_types = ["assignee", "deadline", "priority", "status", "handler"]
+        for field in field_types:
+            csv_logs = csv_audits[csv_audits["field_changed"] == field]
+            json_logs = [log for log in json_audits if log["field_changed"] == field]
+
+            self.assertGreater(
+                len(csv_logs), 0,
+                f"No CSV audit log for field_changed='{field}'",
+            )
+            self.assertGreater(
+                len(json_logs), 0,
+                f"No JSON audit log for field_changed='{field}'",
+            )
+
+            for _, row in csv_logs.iterrows():
+                ts = row["log_timestamp"]
+                self.assertIsNotNone(ts)
+                self.assertNotEqual(ts, "")
+                self.assertRegex(
+                    ts, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                    f"Cannot read CSV {field} operation time from log_timestamp",
+                )
+
+            for log in json_logs:
+                ts = log["log_timestamp"]
+                self.assertIsNotNone(ts)
+                self.assertNotEqual(ts, "")
+                self.assertRegex(
+                    ts, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                    f"Cannot read JSON {field} operation time from log_timestamp",
+                )
+
+    def test_readme_documents_log_timestamp_consistency(self):
+        """README must state that JSON audit_logs fields match CSV,
+        and 'log_timestamp' is the field for operation time.
+        """
+        readme_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "README.md"
+        )
+        with open(readme_path, "r", encoding="utf-8") as f:
+            readme = f.read()
+
+        self.assertIn(
+            "log_timestamp", readme,
+            "README missing 'log_timestamp' — downstream uses this field name",
+        )
+
+        self.assertIn(
+            "audit_logs", readme,
+            "README missing JSON 'audit_logs' array description",
+        )
+
+        self.assertIn(
+            "字段名 / 取值完全一致", readme,
+            "README should state JSON and CSV fields are consistent",
+        )
+
+        csv_audit_section = readme[
+            readme.find("操作记录行字段说明"):readme.find("定位一次变更")
+        ]
+        self.assertIn(
+            "log_timestamp", csv_audit_section,
+            "README CSV audit section must document log_timestamp",
+        )
+
+    def test_timestamp_values_are_correct_for_each_operation(self):
+        """Each audit log entry must have a timestamp reflecting when the
+        operation happened, not the event creation time. Timestamps should
+        be monotonically increasing across sequential operations.
+        """
+        import time
+
+        event = AnomalyEvent(
+            box_id="BX-TSTAMP-SEQ",
+            start_time="2025-06-10 08:00:00",
+            end_time="2025-06-10 09:00:00",
+            max_temperature=-10.0,
+            duration_minutes=60,
+        )
+        save_events([event])
+
+        event_created_at = event.created_at
+
+        time.sleep(1)
+
+        success, _ = update_event_assignment(
+            event.event_id, "早班A", "2025-06-11 18:00:00",
+            Priority.HIGH.value, "主管甲", "分派",
+        )
+        self.assertTrue(success)
+        time.sleep(2)
+
+        success, _ = update_event_assignment(
+            event.event_id, "早班B", "2025-06-12 12:00:00",
+            Priority.URGENT.value, "主管乙", "改期",
+        )
+        self.assertTrue(success)
+        time.sleep(2)
+
+        success, _ = update_event(
+            event.event_id, EventStatus.CONFIRMED.value,
+            "处理员A", "确认",
+        )
+        self.assertTrue(success)
+
+        from app import build_json_export
+        json_payload = build_json_export(load_events())
+        audit_logs = sorted(
+            json_payload["audit_logs"],
+            key=lambda l: l["log_timestamp"],
+        )
+
+        self.assertGreaterEqual(len(audit_logs), 3)
+
+        for log in audit_logs:
+            self.assertGreater(
+                log["log_timestamp"], event_created_at,
+                f"Audit log timestamp {log['log_timestamp']} should be "
+                f"after event creation time {event_created_at}",
+            )
+
+        for i in range(1, len(audit_logs)):
+            self.assertGreaterEqual(
+                audit_logs[i]["log_timestamp"],
+                audit_logs[i - 1]["log_timestamp"],
+                f"Audit log timestamps should be monotonically increasing: "
+                f"log[{i}]={audit_logs[i]['log_timestamp']} < "
+                f"log[{i-1}]={audit_logs[i-1]['log_timestamp']}",
+            )
+
+        field_order = ["assignee", "deadline", "priority", "assignee", "deadline", "priority", "status", "handler", "handler_remark"]
+        for i, log in enumerate(audit_logs[:len(field_order)]):
+            self.assertEqual(
+                log["field_changed"], field_order[i],
+                f"Log {i} field_changed mismatch: expected {field_order[i]}, got {log['field_changed']}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

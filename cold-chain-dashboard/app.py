@@ -153,7 +153,10 @@ def build_json_export(events: list) -> dict:
         evidence_data.extend([ev.to_dict() for ev in get_evidence_for_event(e.event_id)])
     audit_data = []
     for e in events:
-        audit_data.extend([l.to_dict() for l in get_audit_logs_for_event(e.event_id)])
+        for l in get_audit_logs_for_event(e.event_id):
+            log_dict = l.to_dict()
+            log_dict["log_timestamp"] = log_dict.pop("timestamp")
+            audit_data.append(log_dict)
     return {
         "events": export_events,
         "evidence": evidence_data,
