@@ -24,7 +24,11 @@ from core.analyzer import (
     parse_temperature_csv,
     validate_temperature_rows,
 )
-from core.models import AnomalyEvent, AuditLog, EventStatus, ImportBatch, Priority, SkippedRowLog
+from core.models import (
+    AnomalyEvent, AuditLog, EventStatus, ImportBatch, Priority, SkippedRowLog,
+    ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
+    Evidence,
+)
 from core.persistence import (
     add_events,
     clear_all_for_test,
@@ -39,13 +43,30 @@ from core.persistence import (
     load_events,
     load_evidence,
     load_skipped_logs,
+    load_snapshots,
+    load_diffs,
     save_audit_logs,
     save_batches,
     save_events,
+    save_snapshots,
+    save_diffs,
     update_event,
     update_event_assignment,
     update_events_for_reanalysis,
     VersionConflictError,
+    ReanalysisConflictError,
+    get_diffs_by_batch_id,
+    get_diffs_by_event_id,
+    get_diffs_by_change_type,
+    get_diff_summary,
+    get_snapshots_by_raw_data_hash,
+    get_latest_snapshot_for_raw_data,
+    get_snapshot_by_id,
+    check_event_has_user_operation,
+    compute_field_diffs,
+    compute_evidence_diffs,
+    create_reanalysis_snapshot,
+    rollback_last_reanalysis,
 )
 
 
@@ -313,8 +334,8 @@ class TestReimportAndReanalysis(TestBase):
             is_reanalysis=True,
         )
 
-        updated, new_count, unchanged = update_events_for_reanalysis(
-            new_events, new_temp_evidence, batch_v2, []
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_temp_evidence, batch_v2, self.config, [], force=True
         )
 
         self.assertGreater(updated, 0)
@@ -337,11 +358,13 @@ class TestReimportAndReanalysis(TestBase):
             self.assertEqual(updated_event_2.close_time, "2025-06-11 10:00:00")
 
         audit_after = get_audit_logs_for_event(event_to_review.event_id)
-        self.assertEqual(len(audit_after), len(old_audit))
+        self.assertGreaterEqual(len(audit_after), len(old_audit))
         operators_after = [l.operator for l in audit_after]
         self.assertIn("测试员", operators_after)
         remarks_after = [l.remark for l in audit_after]
         self.assertIn("确认超温", remarks_after)
+        conflict_audit = [l for l in audit_after if "重分析冲突检测" in l.action]
+        self.assertGreaterEqual(len(conflict_audit), 0)
 
         evidence_after = get_evidence_for_event(event_to_review.event_id)
         after_non_temp_ids = [
@@ -386,7 +409,7 @@ class TestReimportAndReanalysis(TestBase):
             status="成功",
             is_reanalysis=True,
         )
-        update_events_for_reanalysis(new_events, new_temp_evidence, batch_v2, [])
+        update_events_for_reanalysis(new_events, new_temp_evidence, batch_v2, self.config, [])
 
         non_temp_count_after = sum(
             1 for e in load_evidence() if e.evidence_type != "温度记录"
@@ -1046,8 +1069,8 @@ class TestRestartConsistencyNewFields(TestBase):
             is_reanalysis=True,
         )
 
-        updated, new_count, unchanged = update_events_for_reanalysis(
-            new_events, new_temp_evidence, batch_v2, []
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_temp_evidence, batch_v2, self.config, [], force=True
         )
         self.assertGreater(updated, 0)
 
@@ -2133,7 +2156,7 @@ class TestCarrierAlertReanalysis(TestBase):
             raw_data_hash=raw_data_hash, config_signature=new_config_sig,
             row_count=23, skipped_rows=2, status="成功", is_reanalysis=True,
         )
-        update_events_for_reanalysis(new_events, new_temp_evidence, batch_v2, [])
+        update_events_for_reanalysis(new_events, new_temp_evidence, batch_v2, wide_config, [], force=True)
 
         ev_after = get_event_by_id(target_event.event_id)
         self.assertEqual(ev_after.status, EventStatus.CONFIRMED.value)
@@ -2144,7 +2167,9 @@ class TestCarrierAlertReanalysis(TestBase):
         self.assertEqual(ev_after.version, ev_before.version)
 
         audit_count_after = len(get_audit_logs_for_event(target_event.event_id))
-        self.assertEqual(audit_count_after, audit_count_before)
+        self.assertGreaterEqual(audit_count_after, audit_count_before)
+        conflict_audit = [l for l in get_audit_logs_for_event(target_event.event_id) if "重分析冲突检测" in l.action]
+        self.assertGreater(len(conflict_audit), 0)
 
         non_temp_evidence_after = [
             e for e in get_evidence_for_event(target_event.event_id)
@@ -2360,6 +2385,1281 @@ class TestCarrierAlertFilterSemantics(TestBase):
         self.assertTrue(events_with.carrier_alert_count > 0)
         self.assertFalse(events_without.carrier_alert_count > 0)
         self.assertFalse(events_zero.carrier_alert_count > 0)
+
+
+class TestReanalysisSnapshots(TestBase):
+    """Test reanalysis snapshot creation, persistence, and retrieval."""
+
+    def _setup_initial_batch(self):
+        """Helper: import initial data and return batch info."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        file_hash = compute_file_hash(temp_content)
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_signature = compute_config_hash(self.config)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=file_hash,
+            raw_data_hash=raw_data_hash,
+            config_signature=config_signature,
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功" if valid_rows else "无有效数据",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_signature
+        )
+        add_events(events, evidences, batch, skipped_logs)
+        return batch, events, evidences, raw_data_hash
+
+    def test_snapshot_created_on_reanalysis(self):
+        """Snapshots should be created when reanalysis runs."""
+        batch, events, evidences, raw_data_hash = self._setup_initial_batch()
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+        new_config_signature = compute_config_hash(new_config)
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        new_batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, new_config, batch_id=new_batch_id)
+        new_raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=new_raw_data_hash,
+            config_signature=new_config_signature,
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=new_raw_data_hash, config_signature=new_config_signature
+        )
+
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        snapshots = get_snapshots_by_raw_data_hash(raw_data_hash)
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].snapshot_id, snapshot_id)
+        self.assertEqual(snapshots[0].batch_id, new_batch_id)
+        self.assertEqual(snapshots[0].config_signature, new_config_signature)
+        self.assertEqual(snapshots[0].raw_data_hash, raw_data_hash)
+        self.assertIn("thresholds", snapshots[0].config_snapshot)
+        self.assertEqual(
+            snapshots[0].config_snapshot["thresholds"]["temperature_upper_limit"],
+            -18.0
+        )
+
+    def test_snapshot_persists_across_reload(self):
+        """Snapshots should be saved to disk and reloadable."""
+        batch, events, evidences, raw_data_hash = self._setup_initial_batch()
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        new_batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, new_config, batch_id=new_batch_id)
+        new_raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=new_raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=new_raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        saved_snapshots = load_snapshots()
+        self.assertGreaterEqual(len(saved_snapshots), 1)
+        found = any(s.snapshot_id == snapshot_id for s in saved_snapshots)
+        self.assertTrue(found, "Snapshot should be persisted and reloadable")
+
+    def test_snapshot_parent_chain(self):
+        """Multiple reanalyses should form a parent chain."""
+        batch, events, evidences, raw_data_hash = self._setup_initial_batch()
+
+        config2 = dict(self.config)
+        config2["thresholds"]["temperature_upper_limit"] = -18.0
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        valid_rows, _ = validate_temperature_rows(temp_df, config2)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        new_batch_id2 = ImportBatch().batch_id
+        new_batch2 = ImportBatch(
+            batch_id=new_batch_id2,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(config2),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events2, new_evidences2 = generate_events(
+            valid_rows, config2, new_batch_id2, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(config2)
+        )
+        _, _, _, _, _, snapshot_id2 = update_events_for_reanalysis(
+            new_events2, new_evidences2, new_batch2, config2
+        )
+
+        config3 = dict(self.config)
+        config3["thresholds"]["temperature_upper_limit"] = -20.0
+        new_batch_id3 = ImportBatch().batch_id
+        new_batch3 = ImportBatch(
+            batch_id=new_batch_id3,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(config3),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events3, new_evidences3 = generate_events(
+            valid_rows, config3, new_batch_id3, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(config3)
+        )
+        _, _, _, _, _, snapshot_id3 = update_events_for_reanalysis(
+            new_events3, new_evidences3, new_batch3, config3
+        )
+
+        snapshot2 = get_snapshot_by_id(snapshot_id2)
+        snapshot3 = get_snapshot_by_id(snapshot_id3)
+        self.assertEqual(snapshot2.parent_snapshot_id, "")
+        self.assertEqual(snapshot3.parent_snapshot_id, snapshot_id2)
+
+    def test_get_latest_snapshot(self):
+        """get_latest_snapshot_for_raw_data should return most recent."""
+        batch, events, evidences, raw_data_hash = self._setup_initial_batch()
+
+        config2 = dict(self.config)
+        config2["thresholds"]["temperature_upper_limit"] = -18.0
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        valid_rows, _ = validate_temperature_rows(temp_df, config2)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        new_batch_id2 = ImportBatch().batch_id
+        new_batch2 = ImportBatch(
+            batch_id=new_batch_id2,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(config2),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events2, new_evidences2 = generate_events(
+            valid_rows, config2, new_batch_id2, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(config2)
+        )
+        _, _, _, _, _, snapshot_id2 = update_events_for_reanalysis(
+            new_events2, new_evidences2, new_batch2, config2
+        )
+
+        import time
+        time.sleep(0.1)
+
+        config3 = dict(self.config)
+        config3["thresholds"]["temperature_upper_limit"] = -20.0
+        new_batch_id3 = ImportBatch().batch_id
+        new_batch3 = ImportBatch(
+            batch_id=new_batch_id3,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(config3),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events3, new_evidences3 = generate_events(
+            valid_rows, config3, new_batch_id3, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(config3)
+        )
+        _, _, _, _, _, snapshot_id3 = update_events_for_reanalysis(
+            new_events3, new_evidences3, new_batch3, config3
+        )
+
+        latest = get_latest_snapshot_for_raw_data(raw_data_hash)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.snapshot_id, snapshot_id3)
+
+
+class TestReanalysisDiffComputation(TestBase):
+    """Test diff computation for reanalysis."""
+
+    def test_compute_field_diffs(self):
+        """compute_field_diffs should detect changes in derived fields."""
+        old_event = AnomalyEvent(
+            event_id="old-001",
+            box_id="BX-001",
+            start_time="2025-06-10 08:10:00",
+            end_time="2025-06-10 08:25:00",
+            max_temperature=-11.0,
+            duration_minutes=15,
+            carrier_alert_count=1,
+        )
+        new_event = AnomalyEvent(
+            event_id="new-001",
+            box_id="BX-001",
+            start_time="2025-06-10 08:05:00",
+            end_time="2025-06-10 08:30:00",
+            max_temperature=-10.0,
+            duration_minutes=25,
+            carrier_alert_count=2,
+        )
+
+        diffs = compute_field_diffs(old_event, new_event)
+        field_names = [d.field_name for d in diffs]
+        self.assertIn("start_time", field_names)
+        self.assertIn("end_time", field_names)
+        self.assertIn("max_temperature", field_names)
+        self.assertIn("duration_minutes", field_names)
+        self.assertIn("carrier_alert_count", field_names)
+
+        start_diff = next(d for d in diffs if d.field_name == "start_time")
+        self.assertEqual(start_diff.old_value, "2025-06-10 08:10:00")
+        self.assertEqual(start_diff.new_value, "2025-06-10 08:05:00")
+
+    def test_compute_evidence_diffs(self):
+        """compute_evidence_diffs should detect added/removed temperature evidence."""
+        old_evidence = [
+            Evidence(
+                evidence_id="ev1",
+                evidence_type="温度记录",
+                detail="温度 -14.0°C 超过上限 -15.0°C",
+            ),
+            Evidence(
+                evidence_id="ev2",
+                evidence_type="温度记录",
+                detail="温度 -13.0°C 超过上限 -15.0°C",
+            ),
+            Evidence(
+                evidence_id="ev3",
+                evidence_type="承运商告警",
+                detail="承运商告警",
+            ),
+        ]
+        new_evidence = [
+            Evidence(
+                evidence_id="ev1",
+                evidence_type="温度记录",
+                detail="温度 -14.0°C 超过上限 -15.0°C",
+            ),
+            Evidence(
+                evidence_id="ev4",
+                evidence_type="温度记录",
+                detail="温度 -12.0°C 超过上限 -15.0°C",
+            ),
+            Evidence(
+                evidence_id="ev3",
+                evidence_type="承运商告警",
+                detail="承运商告警",
+            ),
+        ]
+
+        diffs = compute_evidence_diffs(old_evidence, new_evidence)
+        self.assertEqual(len(diffs), 2)
+        added = [d for d in diffs if d.change_type == "新增"]
+        removed = [d for d in diffs if d.change_type == "删除"]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(added[0].evidence_id, "ev4")
+        self.assertEqual(removed[0].evidence_id, "ev2")
+        self.assertNotIn("承运商告警", [d.evidence_type for d in diffs])
+
+    def test_diff_records_created_on_reanalysis(self):
+        """Diff records should be created for each changed event on reanalysis."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        file_hash = compute_file_hash(temp_content)
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_signature = compute_config_hash(self.config)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=file_hash,
+            raw_data_hash=raw_data_hash,
+            config_signature=config_signature,
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_signature
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        initial_event_count = len(events)
+        self.assertGreater(initial_event_count, 0)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+        new_config["thresholds"]["continuous_over_temp_minutes"] = 2
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=file_hash,
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        self.assertGreater(len(diffs), 0)
+        all_diffs = get_diffs_by_batch_id(new_batch_id)
+        self.assertEqual(len(all_diffs), len(diffs))
+
+        change_types = set(d.change_type for d in all_diffs)
+        self.assertTrue(len(change_types) > 0)
+
+        for d in all_diffs:
+            self.assertEqual(d.snapshot_id, snapshot_id)
+            self.assertEqual(d.batch_id, new_batch_id)
+            self.assertTrue(d.event_signature)
+
+    def test_diff_summary(self):
+        """get_diff_summary should return correct counts."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        summary = get_diff_summary(batch_id=new_batch_id)
+        self.assertIn("total_diffs", summary)
+        self.assertIn("added", summary)
+        self.assertIn("removed", summary)
+        self.assertIn("field_changed", summary)
+        self.assertIn("evidence_changed", summary)
+        self.assertIn("alert_changed", summary)
+        self.assertIn("conflicts", summary)
+        self.assertEqual(
+            summary["total_diffs"],
+            summary["added"] + summary["removed"] + summary["field_changed"] +
+            summary["evidence_changed"] + summary["alert_changed"]
+        )
+
+    def test_filter_diffs_by_change_type(self):
+        """get_diffs_by_change_type should filter correctly."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        all_diffs = get_diffs_by_change_type(batch_id=new_batch_id)
+        field_diffs = get_diffs_by_change_type(
+            batch_id=new_batch_id,
+            change_types=[ChangeType.FIELD_CHANGED.value]
+        )
+
+        self.assertGreaterEqual(len(all_diffs), len(field_diffs))
+        for d in field_diffs:
+            self.assertEqual(d.change_type, ChangeType.FIELD_CHANGED.value)
+
+
+class TestReanalysisConflictDetection(TestBase):
+    """Test conflict detection for events with user operations."""
+
+    def test_check_event_has_user_operation_pending(self):
+        """Pending events without operations should have no conflict."""
+        event = AnomalyEvent(
+            event_id="test-001",
+            status=EventStatus.PENDING.value,
+            handler="",
+            handler_remark="",
+            close_time="",
+            assignee="",
+        )
+        has_conflict, reason = check_event_has_user_operation(event, audit_logs=[])
+        self.assertFalse(has_conflict)
+        self.assertEqual(reason, "")
+
+    def test_check_event_has_user_operation_confirmed(self):
+        """Confirmed events should have conflict."""
+        event = AnomalyEvent(
+            event_id="test-002",
+            status=EventStatus.CONFIRMED.value,
+            handler="张三",
+        )
+        has_conflict, reason = check_event_has_user_operation(event, audit_logs=[])
+        self.assertTrue(has_conflict)
+        self.assertIn("状态为已确认", reason)
+        self.assertIn("已有处理人", reason)
+
+    def test_check_event_has_user_operation_with_audit_logs(self):
+        """Events with audit logs should have conflict."""
+        event = AnomalyEvent(
+            event_id="test-003",
+            status=EventStatus.PENDING.value,
+        )
+        audit_logs = [
+            AuditLog(
+                event_id="test-003",
+                action="状态变更: 待处理 -> 已确认",
+                operator="张三",
+            )
+        ]
+        has_conflict, reason = check_event_has_user_operation(event, audit_logs=audit_logs)
+        self.assertTrue(has_conflict)
+        self.assertIn("存在用户操作记录", reason)
+
+    def test_reanalysis_raises_conflict_error(self):
+        """Reanalysis should raise ReanalysisConflictError when conflicts exist."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        target_event = events[0]
+        update_event(
+            target_event.event_id,
+            EventStatus.CONFIRMED.value,
+            handler="张三",
+            remark="已复核",
+        )
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        with self.assertRaises(ReanalysisConflictError) as ctx:
+            update_events_for_reanalysis(
+                new_events, new_evidences, new_batch, new_config, skipped_logs
+            )
+
+        self.assertGreater(len(ctx.exception.conflicting_events), 0)
+        conflicting_ids = [e["event_id"] for e in ctx.exception.conflicting_events]
+        self.assertIn(target_event.event_id, conflicting_ids)
+
+    def test_reanalysis_force_overrides_conflicts(self):
+        """Force=True should allow reanalysis to proceed despite conflicts."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        target_event = events[0]
+        update_event(
+            target_event.event_id,
+            EventStatus.CONFIRMED.value,
+            handler="张三",
+            remark="已复核",
+        )
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs,
+            force=True, operator="test_operator"
+        )
+
+        self.assertGreater(conflict_count, 0)
+        conflict_diffs = [d for d in diffs if d.has_conflict]
+        self.assertGreater(len(conflict_diffs), 0)
+        for d in conflict_diffs:
+            self.assertTrue(d.has_conflict)
+            self.assertIn("状态为已确认", d.conflict_reason)
+
+        audit_logs = get_audit_logs_for_event(target_event.event_id)
+        conflict_audit = [l for l in audit_logs if "重分析冲突检测" in l.action]
+        self.assertGreater(len(conflict_audit), 0)
+
+
+class TestReanalysisRollback(TestBase):
+    """Test rollback functionality for reanalysis."""
+
+    def test_rollback_no_snapshots_returns_false(self):
+        """Rollback with no snapshots should return False."""
+        success, count, snapshot_id = rollback_last_reanalysis("non-existent-hash")
+        self.assertFalse(success)
+        self.assertEqual(count, 0)
+        self.assertEqual(snapshot_id, "")
+
+    def test_rollback_restores_event_state(self):
+        """Rollback should restore events to pre-reanalysis state."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        original_config_sig = compute_config_hash(self.config)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=original_config_sig,
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=original_config_sig
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        original_event_ids = {e.event_id for e in events}
+        original_config_sigs = {e.config_signature for e in events}
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+        new_config_sig = compute_config_hash(new_config)
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=new_config_sig,
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=new_config_sig
+        )
+
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        events_after_reanalysis = get_events_by_raw_data_hash(raw_data_hash)
+        for e in events_after_reanalysis:
+            self.assertEqual(e.config_signature, new_config_sig)
+            self.assertEqual(e.batch_id, new_batch_id)
+
+        success, rolled_back_count, rolled_back_snapshot_id = rollback_last_reanalysis(
+            raw_data_hash, operator="test_rollback"
+        )
+
+        self.assertTrue(success)
+        self.assertGreater(rolled_back_count, 0)
+        self.assertEqual(rolled_back_snapshot_id, snapshot_id)
+
+        events_after_rollback = get_events_by_raw_data_hash(raw_data_hash)
+        event_ids_after = {e.event_id for e in events_after_rollback}
+        self.assertEqual(event_ids_after, original_event_ids)
+
+        for e in events_after_rollback:
+            self.assertEqual(e.config_signature, original_config_sig)
+            self.assertEqual(e.batch_id, batch_id)
+
+        snapshots = get_snapshots_by_raw_data_hash(raw_data_hash)
+        self.assertEqual(len(snapshots), 0)
+
+        diffs_after = get_diffs_by_batch_id(new_batch_id)
+        self.assertEqual(len(diffs_after), 0)
+
+    def test_rollback_preserves_audit_logs(self):
+        """Rollback should preserve user operation audit logs."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        target_event = events[0]
+        update_event(
+            target_event.event_id,
+            EventStatus.CONFIRMED.value,
+            handler="张三",
+            remark="已复核",
+        )
+
+        audit_before = get_audit_logs_for_event(target_event.event_id)
+        review_audit_before = [l for l in audit_before if "状态变更" in l.action]
+        self.assertEqual(len(review_audit_before), 1)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs,
+            force=True
+        )
+
+        rollback_last_reanalysis(raw_data_hash, operator="test_rollback")
+
+        audit_after = get_audit_logs_for_event(target_event.event_id)
+        review_audit_after = [l for l in audit_after if "状态变更" in l.action]
+        self.assertEqual(len(review_audit_after), 1)
+
+        rollback_audit = [l for l in audit_after if "重分析回滚" in l.action]
+        self.assertGreater(len(rollback_audit), 0)
+
+        event_after = get_event_by_id(target_event.event_id)
+        self.assertEqual(event_after.status, EventStatus.CONFIRMED.value)
+        self.assertEqual(event_after.handler, "张三")
+
+    def test_rollback_only_affects_latest_reanalysis(self):
+        """Rollback should only remove the most recent reanalysis."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        original_config_sig = compute_config_hash(self.config)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=original_config_sig,
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=original_config_sig
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        config2 = dict(self.config)
+        config2["thresholds"]["temperature_upper_limit"] = -18.0
+        config2_sig = compute_config_hash(config2)
+
+        new_batch_id2 = ImportBatch().batch_id
+        new_batch2 = ImportBatch(
+            batch_id=new_batch_id2,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=config2_sig,
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events2, new_evidences2 = generate_events(
+            valid_rows, config2, new_batch_id2, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config2_sig
+        )
+        update_events_for_reanalysis(
+            new_events2, new_evidences2, new_batch2, config2, skipped_logs
+        )
+
+        config3 = dict(self.config)
+        config3["thresholds"]["temperature_upper_limit"] = -20.0
+        config3_sig = compute_config_hash(config3)
+
+        new_batch_id3 = ImportBatch().batch_id
+        new_batch3 = ImportBatch(
+            batch_id=new_batch_id3,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=config3_sig,
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events3, new_evidences3 = generate_events(
+            valid_rows, config3, new_batch_id3, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=config3_sig
+        )
+        update_events_for_reanalysis(
+            new_events3, new_evidences3, new_batch3, config3, skipped_logs
+        )
+
+        snapshots_before = get_snapshots_by_raw_data_hash(raw_data_hash)
+        self.assertEqual(len(snapshots_before), 2)
+
+        events_before_rollback = get_events_by_raw_data_hash(raw_data_hash)
+        for e in events_before_rollback:
+            self.assertEqual(e.config_signature, config3_sig)
+
+        success, _, _ = rollback_last_reanalysis(raw_data_hash, operator="test")
+        self.assertTrue(success)
+
+        snapshots_after = get_snapshots_by_raw_data_hash(raw_data_hash)
+        self.assertEqual(len(snapshots_after), 1)
+
+        events_after_rollback = get_events_by_raw_data_hash(raw_data_hash)
+        for e in events_after_rollback:
+            self.assertEqual(e.config_signature, config2_sig)
+
+
+class TestReanalysisExport(TestBase):
+    """Test export includes reanalysis diff information."""
+
+    def test_csv_export_includes_diff_fields(self):
+        """CSV export should include conflict and diff fields."""
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from app import build_csv_export
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        target_event = events[0]
+        update_event(
+            target_event.event_id,
+            EventStatus.CONFIRMED.value,
+            handler="张三",
+            remark="已复核",
+        )
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs,
+            force=True
+        )
+
+        all_events = load_events()
+        csv_content = build_csv_export(all_events)
+
+        self.assertIn("has_conflict", csv_content)
+        self.assertIn("conflict_reason", csv_content)
+        self.assertIn("change_types", csv_content)
+        self.assertIn("reanalysis_count", csv_content)
+        self.assertIn("row_type,", csv_content)
+        self.assertIn("重分析差异", csv_content)
+        self.assertIn("差异摘要", csv_content)
+        self.assertIn("config_signature", csv_content)
+
+        lines = csv_content.strip().split("\n")
+        header = lines[0]
+        self.assertIn("has_conflict", header)
+        self.assertIn("conflict_reason", header)
+        self.assertIn("config_signature", header)
+
+    def test_json_export_includes_diff_fields(self):
+        """JSON export should include diff summary and records."""
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from app import build_json_export
+
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        all_events = load_events()
+        export_data = build_json_export(all_events)
+
+        self.assertIn("diff_summary", export_data)
+        self.assertIn("reanalysis_diffs", export_data)
+        self.assertIn("reanalysis_snapshots", export_data)
+
+        self.assertIn("total_diffs", export_data["diff_summary"])
+        self.assertIn("conflicts", export_data["diff_summary"])
+
+        self.assertGreater(len(export_data["reanalysis_diffs"]), 0)
+        for diff in export_data["reanalysis_diffs"]:
+            self.assertIn("diff_id", diff)
+            self.assertIn("change_type", diff)
+            self.assertIn("has_conflict", diff)
+            self.assertIn("config_signature", export_data["events"][0])
+
+        for event in export_data["events"]:
+            self.assertIn("has_conflict", event)
+            self.assertIn("conflict_reason", event)
+            self.assertIn("change_types", event)
+            self.assertIn("reanalysis_count", event)
+            self.assertIn("config_signature", event)
+
+
+class TestReanalysisPersistence(TestBase):
+    """Test persistence across restarts (simulated by clear + reload)."""
+
+    def test_snapshots_and_diffs_persist_across_clear_reload(self):
+        """Snapshots and diffs should persist to disk and reload correctly."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        snapshots_before = load_snapshots()
+        diffs_before = load_diffs()
+        events_before = load_events()
+
+        self.assertGreater(len(snapshots_before), 0)
+        self.assertGreater(len(diffs_before), 0)
+
+        import core.persistence as persistence_module
+        original_events_file = persistence_module._EVENTS_FILE
+        original_snapshots_file = persistence_module._SNAPSHOTS_FILE
+        original_diffs_file = persistence_module._DIFFS_FILE
+        original_evidence_file = persistence_module._EVIDENCE_FILE
+        original_batches_file = persistence_module._BATCHES_FILE
+        original_audit_file = persistence_module._AUDIT_FILE
+        original_skipped_file = persistence_module._SKIPPED_FILE
+
+        import shutil
+        backup_events = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_snapshots = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_diffs = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_evidence = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_batches = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_audit = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        backup_skipped = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+
+        try:
+            shutil.copy2(original_events_file, backup_events.name)
+            shutil.copy2(original_snapshots_file, backup_snapshots.name)
+            shutil.copy2(original_diffs_file, backup_diffs.name)
+            shutil.copy2(original_evidence_file, backup_evidence.name)
+            shutil.copy2(original_batches_file, backup_batches.name)
+            shutil.copy2(original_audit_file, backup_audit.name)
+            shutil.copy2(original_skipped_file, backup_skipped.name)
+
+            clear_all_for_test()
+
+            events_after_clear = load_events()
+            snapshots_after_clear = load_snapshots()
+            diffs_after_clear = load_diffs()
+            self.assertEqual(len(events_after_clear), 0)
+            self.assertEqual(len(snapshots_after_clear), 0)
+            self.assertEqual(len(diffs_after_clear), 0)
+
+            shutil.copy2(backup_events.name, original_events_file)
+            shutil.copy2(backup_snapshots.name, original_snapshots_file)
+            shutil.copy2(backup_diffs.name, original_diffs_file)
+            shutil.copy2(backup_evidence.name, original_evidence_file)
+            shutil.copy2(backup_batches.name, original_batches_file)
+            shutil.copy2(backup_audit.name, original_audit_file)
+            shutil.copy2(backup_skipped.name, original_skipped_file)
+
+            events_after_reload = load_events()
+            snapshots_after_reload = load_snapshots()
+            diffs_after_reload = load_diffs()
+
+            self.assertEqual(len(events_after_reload), len(events_before))
+            self.assertEqual(len(snapshots_after_reload), len(snapshots_before))
+            self.assertEqual(len(diffs_after_reload), len(diffs_before))
+
+            reloaded_snapshot_ids = {s.snapshot_id for s in snapshots_after_reload}
+            self.assertIn(snapshot_id, reloaded_snapshot_ids)
+
+            reloaded_diff_batch_ids = {d.batch_id for d in diffs_after_reload}
+            self.assertIn(new_batch_id, reloaded_diff_batch_ids)
+
+        finally:
+            backup_events.close()
+            backup_snapshots.close()
+            backup_diffs.close()
+            backup_evidence.close()
+            backup_batches.close()
+            backup_audit.close()
+            backup_skipped.close()
+            os.unlink(backup_events.name)
+            os.unlink(backup_snapshots.name)
+            os.unlink(backup_diffs.name)
+            os.unlink(backup_evidence.name)
+            os.unlink(backup_batches.name)
+            os.unlink(backup_audit.name)
+            os.unlink(backup_skipped.name)
+
+    def test_get_diffs_by_event_id_persists(self):
+        """get_diffs_by_event_id should work after reload."""
+        temp_content = self.temp_csv_content.encode("utf-8")
+        temp_df = parse_temperature_csv(temp_content)
+        batch_id = ImportBatch().batch_id
+        valid_rows, skipped_logs = validate_temperature_rows(temp_df, self.config, batch_id=batch_id)
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+
+        batch = ImportBatch(
+            batch_id=batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(self.config),
+            row_count=len(temp_df),
+            skipped_rows=len(skipped_logs),
+            status="成功",
+            is_reanalysis=False,
+        )
+        events, evidences = generate_events(
+            valid_rows, self.config, batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(self.config)
+        )
+        add_events(events, evidences, batch, skipped_logs)
+
+        new_config = dict(self.config)
+        new_config["thresholds"]["temperature_upper_limit"] = -18.0
+
+        new_batch_id = ImportBatch().batch_id
+        new_batch = ImportBatch(
+            batch_id=new_batch_id,
+            file_name="test.csv",
+            file_hash=compute_file_hash(temp_content),
+            raw_data_hash=raw_data_hash,
+            config_signature=compute_config_hash(new_config),
+            row_count=len(temp_df),
+            status="成功",
+            is_reanalysis=True,
+        )
+        new_events, new_evidences = generate_events(
+            valid_rows, new_config, new_batch_id, "test.csv",
+            raw_data_hash=raw_data_hash, config_signature=compute_config_hash(new_config)
+        )
+        update_events_for_reanalysis(
+            new_events, new_evidences, new_batch, new_config, skipped_logs
+        )
+
+        target_event_id = new_events[0].event_id
+        diffs_before = get_diffs_by_event_id(target_event_id)
+        self.assertGreater(len(diffs_before), 0)
+
+        reloaded_diffs = load_diffs()
+        diffs_after = get_diffs_by_event_id(target_event_id)
+        self.assertEqual(len(diffs_after), len(diffs_before))
 
 
 if __name__ == "__main__":

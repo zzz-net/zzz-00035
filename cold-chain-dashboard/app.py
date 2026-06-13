@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 from datetime import datetime
+from typing import Dict
 
 import pandas as pd
 import streamlit as st
@@ -29,16 +30,28 @@ from core.persistence import (
     get_audit_logs_for_event,
     get_evidence_for_event,
     get_event_by_id,
+    get_events_by_raw_data_hash,
     get_skipped_logs_for_batch,
     is_exact_duplicate_batch,
     is_duplicate_batch,
     load_audit_logs,
     load_batches,
     load_events,
+    load_snapshots,
+    load_diffs,
     update_event,
     update_event_assignment,
     update_events_for_reanalysis,
     VersionConflictError,
+    ReanalysisConflictError,
+    get_diffs_by_batch_id,
+    get_diffs_by_event_id,
+    get_diffs_by_change_type,
+    get_diff_summary,
+    get_snapshots_by_raw_data_hash,
+    get_latest_snapshot_for_raw_data,
+    rollback_last_reanalysis,
+    ChangeType,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,7 +71,7 @@ def save_config(cfg):
 st.set_page_config(page_title="冷链到货温控复盘看板", layout="wide")
 st.title("🧊 冷链到货温控复盘看板")
 
-menu = st.sidebar.radio("导航", ["数据导入", "异常事件看板", "事件复核", "导出", "阈值配置", "导入历史"])
+menu = st.sidebar.radio("导航", ["数据导入", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
 
 cfg = load_config()
 
@@ -99,12 +112,40 @@ def build_csv_export(events: list) -> str:
     便于 Excel 直接打开中文），避免内部对 StringIO 传 encoding 参数无效。
     """
     csv_rows = []
+    event_ids = [e.event_id for e in events]
+    all_diffs = load_diffs() if events else []
+    relevant_diffs = [
+        d for d in all_diffs
+        if d.old_event_id in event_ids or d.new_event_id in event_ids
+    ]
+
+    diff_by_event: Dict[str, list] = {}
+    for d in relevant_diffs:
+        if d.old_event_id:
+            diff_by_event.setdefault(d.old_event_id, []).append(d)
+        if d.new_event_id and d.new_event_id != d.old_event_id:
+            diff_by_event.setdefault(d.new_event_id, []).append(d)
+
+    total_diff_summary = get_diff_summary() if events else {}
+
     for e in events:
+        event_diffs = diff_by_event.get(e.event_id, [])
+        has_conflict = any(d.has_conflict for d in event_diffs)
+        conflict_reason = "; ".join([d.conflict_reason for d in event_diffs if d.has_conflict])
+        change_types = sorted(set(d.change_type for d in event_diffs))
+
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
         event_dict["row_type"] = "事件"
         event_dict["has_carrier_alert"] = e.carrier_alert_count > 0
+        event_dict["has_conflict"] = has_conflict
+        event_dict["conflict_reason"] = conflict_reason
+        event_dict["change_types"] = ", ".join(change_types)
+        event_dict["reanalysis_count"] = len(event_diffs)
+        event_dict["duration_minutes"] = str(int(e.duration_minutes))
+        event_dict["version"] = str(int(e.version))
+        event_dict["carrier_alert_count"] = str(int(e.carrier_alert_count))
         csv_rows.append(event_dict)
 
         for log in get_audit_logs_for_event(e.event_id):
@@ -122,6 +163,45 @@ def build_csv_export(events: list) -> str:
                 "remark": log.remark,
             })
 
+        for d in event_diffs:
+            field_changes = "; ".join([
+                f"{fd.field_name}: {fd.old_value} → {fd.new_value}"
+                for fd in d.field_diffs
+            ])
+            evidence_changes = "; ".join([
+                f"{ed.change_type}-{ed.evidence_type}: {ed.new_detail or ed.old_detail}"
+                for ed in d.evidence_diffs
+            ])
+            csv_rows.append({
+                "row_type": "重分析差异",
+                "event_id": e.event_id,
+                "box_id": e.box_id,
+                "diff_id": d.diff_id,
+                "snapshot_id": d.snapshot_id,
+                "batch_id": d.batch_id,
+                "change_type": d.change_type,
+                "event_signature": d.event_signature,
+                "alert_count_old": d.alert_count_old,
+                "alert_count_new": d.alert_count_new,
+                "has_conflict": d.has_conflict,
+                "conflict_reason": d.conflict_reason,
+                "field_changes": field_changes,
+                "evidence_changes": evidence_changes,
+                "diff_timestamp": d.created_at,
+            })
+
+    if total_diff_summary:
+        csv_rows.append({
+            "row_type": "差异摘要",
+            "total_diffs": total_diff_summary["total_diffs"],
+            "added": total_diff_summary["added"],
+            "removed": total_diff_summary["removed"],
+            "field_changed": total_diff_summary["field_changed"],
+            "evidence_changed": total_diff_summary["evidence_changed"],
+            "alert_changed": total_diff_summary["alert_changed"],
+            "conflicts": total_diff_summary["conflicts"],
+        })
+
     df = pd.DataFrame(csv_rows)
     column_order = [
         "row_type", "event_id", "box_id",
@@ -135,6 +215,12 @@ def build_csv_export(events: list) -> str:
         "operator", "log_timestamp", "remark",
         "batch_id", "raw_data_hash", "config_signature", "event_signature",
         "evidence_ids",
+        "has_conflict", "conflict_reason", "change_types", "reanalysis_count",
+        "diff_id", "snapshot_id", "change_type",
+        "alert_count_old", "alert_count_new",
+        "field_changes", "evidence_changes", "diff_timestamp",
+        "total_diffs", "added", "removed", "field_changed",
+        "evidence_changed", "alert_changed", "conflicts",
     ]
     available_cols = [c for c in column_order if c in df.columns]
     df = df[available_cols]
@@ -145,11 +231,35 @@ def build_csv_export(events: list) -> str:
 
 def build_json_export(events: list) -> dict:
     export_events = []
+    event_ids = [e.event_id for e in events]
+    all_diffs = load_diffs() if events else []
+    relevant_diffs = [
+        d for d in all_diffs
+        if d.old_event_id in event_ids or d.new_event_id in event_ids
+    ]
+
+    diff_by_event: Dict[str, list] = {}
+    for d in relevant_diffs:
+        if d.old_event_id:
+            diff_by_event.setdefault(d.old_event_id, []).append(d)
+        if d.new_event_id and d.new_event_id != d.old_event_id:
+            diff_by_event.setdefault(d.new_event_id, []).append(d)
+
     for e in events:
+        event_diffs = diff_by_event.get(e.event_id, [])
+        has_conflict = any(d.has_conflict for d in event_diffs)
+        conflict_reason = "; ".join([d.conflict_reason for d in event_diffs if d.has_conflict])
+        change_types = sorted(set(d.change_type for d in event_diffs))
+
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
         event_dict["has_carrier_alert"] = e.carrier_alert_count > 0
+        event_dict["has_conflict"] = has_conflict
+        event_dict["conflict_reason"] = conflict_reason
+        event_dict["change_types"] = change_types
+        event_dict["reanalysis_count"] = len(event_diffs)
+        event_dict["reanalysis_diffs"] = [d.to_dict() for d in event_diffs]
         export_events.append(event_dict)
 
     evidence_data = []
@@ -161,10 +271,24 @@ def build_json_export(events: list) -> dict:
             log_dict = l.to_dict()
             log_dict["log_timestamp"] = log_dict.pop("timestamp")
             audit_data.append(log_dict)
+
+    snapshots = load_snapshots() if events else []
+    relevant_snapshot_ids = set()
+    for d in relevant_diffs:
+        relevant_snapshot_ids.add(d.snapshot_id)
+    relevant_snapshots = [
+        s.to_dict() for s in snapshots if s.snapshot_id in relevant_snapshot_ids
+    ]
+
+    total_diff_summary = get_diff_summary() if events else {}
+
     return {
         "events": export_events,
         "evidence": evidence_data,
         "audit_logs": audit_data,
+        "reanalysis_diffs": [d.to_dict() for d in relevant_diffs],
+        "reanalysis_snapshots": relevant_snapshots,
+        "diff_summary": total_diff_summary,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -257,14 +381,47 @@ if menu == "数据导入":
                         st.warning(f"承运商告警解析失败: {e}")
 
                 if is_reanalysis:
-                    updated, new_count, unchanged = update_events_for_reanalysis(
-                        events, evidences, batch, skipped_logs
-                    )
-                    st.success(
-                        f"🔄 重新分析完成: 更新 {updated} 个事件, 新增 {new_count} 个事件, "
-                        f"其他 {unchanged} 个事件保持不变。\n\n"
-                        f"原始复核状态、处理人、处理备注、关闭时间和审计日志已全部保留。"
-                    )
+                    try:
+                        updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+                            events, evidences, batch, cfg, skipped_logs
+                        )
+                        diff_summary = get_diff_summary(batch_id=batch.batch_id)
+                        st.success(
+                            f"🔄 重新分析完成: 更新 {updated} 个事件, 新增 {new_count} 个事件, "
+                            f"消失 {removed_count} 个事件, 冲突 {conflict_count} 个事件。\n\n"
+                            f"差异统计: 新增 {diff_summary['added']}, 消失 {diff_summary['removed']}, "
+                            f"字段变更 {diff_summary['field_changed']}, 证据变更 {diff_summary['evidence_changed']}, "
+                            f"告警变更 {diff_summary['alert_changed']}。\n\n"
+                            f"原始复核状态、处理人、处理备注、关闭时间和审计日志已全部保留。\n\n"
+                            f"快照ID: {snapshot_id}"
+                        )
+                        if conflict_count > 0:
+                            st.warning(
+                                f"⚠️ 检测到 {conflict_count} 个事件存在用户操作记录。"
+                                f"请前往「重分析追踪」页面查看详情并决定是否覆盖。"
+                            )
+                    except ReanalysisConflictError as e:
+                        st.error(f"❌ {str(e)}")
+                        with st.expander("查看所有冲突事件", expanded=True):
+                            for conflict in e.conflicting_events:
+                                st.markdown(
+                                    f"- **事件ID**: {conflict['event_id']} | "
+                                    f"**箱号**: {conflict['box_id']} | "
+                                    f"**原因**: {conflict['reason']}"
+                                )
+                        if st.button("强制重新分析（覆盖用户操作记录）", type="secondary"):
+                            updated, new_count, removed_count, conflict_count, diffs, snapshot_id = update_events_for_reanalysis(
+                                events, evidences, batch, cfg, skipped_logs,
+                                force=True, operator="user_override"
+                            )
+                            diff_summary = get_diff_summary(batch_id=batch.batch_id)
+                            st.success(
+                                f"🔄 强制重新分析完成: 更新 {updated} 个事件, 新增 {new_count} 个事件, "
+                                f"消失 {removed_count} 个事件。\n\n"
+                                f"已覆盖 {conflict_count} 个冲突事件。\n\n"
+                                f"快照ID: {snapshot_id}"
+                            )
+                            st.rerun()
                 else:
                     if events:
                         add_events(events, evidences + receipt_evidence + alert_evidence, batch, skipped_logs)
@@ -396,6 +553,34 @@ elif menu == "异常事件看板":
                         field_info = f" | 字段: {l.field_changed}" if l.field_changed else ""
                         value_info = f" | {l.old_value} → {l.new_value}" if l.old_value or l.new_value else ""
                         st.markdown(f"- [{l.timestamp}] {l.action} | 操作人: {l.operator}{field_info}{value_info} | 备注: {l.remark}")
+
+                st.markdown("---")
+                st.subheader("重分析差异追踪")
+                event_diffs = get_diffs_by_event_id(ev.event_id)
+                if event_diffs:
+                    st.markdown(f"共发现 **{len(event_diffs)}** 条重分析差异记录")
+                    for diff in event_diffs:
+                        conflict_badge = "⚠️ **冲突**" if diff.has_conflict else "✅ 无冲突"
+                        st.markdown(f"### [{diff.change_type}] 批次 {diff.batch_id} {conflict_badge}")
+                        st.markdown(f"- **快照ID**: {diff.snapshot_id}")
+                        st.markdown(f"- **事件签名**: {diff.event_signature}")
+                        st.markdown(f"- **告警数量变化**: {diff.alert_count_old} → {diff.alert_count_new}")
+                        if diff.has_conflict:
+                            st.warning(f"**冲突原因**: {diff.conflict_reason}")
+                        if diff.field_diffs:
+                            st.markdown("**字段变更:**")
+                            for fd in diff.field_diffs:
+                                st.markdown(f"  - `{fd.field_name}`: `{fd.old_value}` → `{fd.new_value}`")
+                        if diff.evidence_diffs:
+                            st.markdown("**证据变更:**")
+                            for ed in diff.evidence_diffs:
+                                if ed.change_type == "新增":
+                                    st.markdown(f"  - ➕ [{ed.evidence_type}] 新增: {ed.new_detail}")
+                                else:
+                                    st.markdown(f"  - ➖ [{ed.evidence_type}] 删除: {ed.old_detail}")
+                        st.markdown(f"- **创建时间**: {diff.created_at}")
+                else:
+                    st.info("该事件暂无重分析差异记录")
             else:
                 st.warning("未找到该事件")
 
@@ -581,6 +766,136 @@ elif menu == "事件复核":
                     except VersionConflictError as e:
                         st.error(f"❌ {str(e)}")
                         st.session_state.current_event_version = e.current_version
+
+
+elif menu == "重分析追踪":
+    st.header("🔄 重分析差异追踪")
+
+    batches = load_batches()
+    reanalysis_batches = [b for b in batches if b.is_reanalysis]
+
+    if not reanalysis_batches:
+        st.info("暂无重分析记录")
+    else:
+        st.markdown(f"共 **{len(reanalysis_batches)}** 次重分析记录")
+
+        batch_options = [
+            f"{b.import_time} | {b.batch_id} | {b.file_name} | 配置签名: {b.config_signature[:8]}"
+            for b in reanalysis_batches
+        ]
+        selected_idx = st.selectbox(
+            "选择重分析批次",
+            range(len(batch_options)),
+            format_func=lambda i: batch_options[i],
+        )
+        selected_batch = reanalysis_batches[selected_idx]
+
+        col_info1, col_info2, col_info3, col_info4 = st.columns(4)
+        diff_summary = get_diff_summary(batch_id=selected_batch.batch_id)
+        col_info1.metric("总差异数", diff_summary["total_diffs"])
+        col_info2.metric("新增事件", diff_summary["added"])
+        col_info3.metric("消失事件", diff_summary["removed"])
+        col_info4.metric("冲突事件", diff_summary["conflicts"])
+
+        col_info5, col_info6, col_info7, col_info8 = st.columns(4)
+        col_info5.metric("字段变更", diff_summary["field_changed"])
+        col_info6.metric("证据变更", diff_summary["evidence_changed"])
+        col_info7.metric("告警变更", diff_summary["alert_changed"])
+        col_info8.metric("配置签名", selected_batch.config_signature[:8])
+
+        st.markdown("---")
+        st.subheader("配置快照")
+        snapshots = get_snapshots_by_raw_data_hash(selected_batch.raw_data_hash)
+        batch_snapshot = next((s for s in snapshots if s.batch_id == selected_batch.batch_id), None)
+        if batch_snapshot:
+            st.markdown(f"**快照ID**: {batch_snapshot.snapshot_id}")
+            st.markdown(f"**父快照**: {batch_snapshot.parent_snapshot_id or '无'}")
+            st.markdown(f"**操作人**: {batch_snapshot.operator}")
+            st.markdown(f"**创建时间**: {batch_snapshot.created_at}")
+            with st.expander("查看完整配置快照", expanded=False):
+                st.json(batch_snapshot.config_snapshot)
+
+        st.markdown("---")
+        st.subheader("差异筛选")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            change_type_filter = st.multiselect(
+                "按变更类型筛选",
+                [ct.value for ct in ChangeType],
+                default=[ct.value for ct in ChangeType],
+            )
+        with col_f2:
+            conflict_filter = st.selectbox(
+                "按冲突状态筛选",
+                ["全部", "仅显示冲突", "仅显示无冲突"],
+                index=0,
+            )
+
+        include_conflicts_only = conflict_filter == "仅显示冲突"
+        filtered_diffs = get_diffs_by_change_type(
+            batch_id=selected_batch.batch_id,
+            change_types=change_type_filter if change_type_filter else None,
+            include_conflicts_only=include_conflicts_only,
+        )
+
+        if not filtered_diffs:
+            st.info("无匹配的差异记录")
+        else:
+            st.markdown(f"显示 **{len(filtered_diffs)}** 条差异记录")
+
+            for diff in filtered_diffs:
+                conflict_icon = "⚠️" if diff.has_conflict else "✅"
+                st.markdown("---")
+                st.markdown(f"### {conflict_icon} [{diff.change_type}] 事件 {diff.event_signature[:8]}")
+                st.markdown(f"- **批次ID**: {diff.batch_id}")
+                st.markdown(f"- **快照ID**: {diff.snapshot_id}")
+                if diff.old_event_id:
+                    st.markdown(f"- **原事件ID**: {diff.old_event_id}")
+                if diff.new_event_id:
+                    st.markdown(f"- **新事件ID**: {diff.new_event_id}")
+                st.markdown(f"- **告警数量**: {diff.alert_count_old} → {diff.alert_count_new}")
+                if diff.has_conflict:
+                    st.error(f"**冲突**: {diff.conflict_reason}")
+                if diff.field_diffs:
+                    st.markdown("**字段变更:**")
+                    for fd in diff.field_diffs:
+                        st.markdown(f"  - `{fd.field_name}`: `{fd.old_value}` → `{fd.new_value}`")
+                if diff.evidence_diffs:
+                    st.markdown("**证据变更:**")
+                    for ed in diff.evidence_diffs:
+                        if ed.change_type == "新增":
+                            st.markdown(f"  - ➕ [{ed.evidence_type}] 新增: {ed.new_detail}")
+                        else:
+                            st.markdown(f"  - ➖ [{ed.evidence_type}] 删除: {ed.old_detail}")
+                st.markdown(f"- **记录时间**: {diff.created_at}")
+
+        st.markdown("---")
+        st.subheader("撤销重分析")
+        latest_snapshot = get_latest_snapshot_for_raw_data(selected_batch.raw_data_hash)
+        if latest_snapshot and latest_snapshot.batch_id == selected_batch.batch_id:
+            st.warning(
+                f"⚠️ 将撤销最近一次重分析（批次: {selected_batch.batch_id}），"
+                f"回滚到重分析前的状态。用户操作日志将被保留。"
+            )
+            rollback_operator = st.text_input("操作人", value="admin", key="rollback_operator")
+            if st.button("撤销本次重分析", type="primary"):
+                if not rollback_operator.strip():
+                    st.error("请填写操作人")
+                else:
+                    success, rolled_back_count, snapshot_id = rollback_last_reanalysis(
+                        selected_batch.raw_data_hash,
+                        operator=rollback_operator.strip()
+                    )
+                    if success:
+                        st.success(
+                            f"✅ 撤销成功！已回滚 {rolled_back_count} 个事件。"
+                            f"快照 {snapshot_id} 已删除。"
+                        )
+                        st.rerun()
+                    else:
+                        st.error("❌ 撤销失败，没有找到可回滚的重分析记录")
+        else:
+            st.info("本次重分析不是最新的，无法撤销。只能撤销最近一次重分析。")
 
 
 elif menu == "导出":

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 import uuid
 
 
@@ -23,6 +23,80 @@ class EvidenceType(str, Enum):
     TEMPERATURE_RECORD = "温度记录"
     RECEIPT_NOTE = "收货备注"
     CARRIER_ALERT = "承运商告警"
+
+
+class ChangeType(str, Enum):
+    ADDED = "新增"
+    REMOVED = "消失"
+    FIELD_CHANGED = "字段变更"
+    EVIDENCE_CHANGED = "证据变更"
+    ALERT_CHANGED = "告警匹配变更"
+
+
+@dataclass
+class ReanalysisSnapshot:
+    snapshot_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    batch_id: str = ""
+    raw_data_hash: str = ""
+    config_signature: str = ""
+    config_snapshot: dict = field(default_factory=dict)
+    event_ids: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    parent_snapshot_id: str = ""
+    operator: str = "system"
+    pre_events: list = field(default_factory=list)
+    pre_evidence: list = field(default_factory=list)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class FieldDiff:
+    field_name: str = ""
+    old_value: str = ""
+    new_value: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class EvidenceDiff:
+    evidence_id: str = ""
+    change_type: str = ""
+    evidence_type: str = ""
+    old_detail: str = ""
+    new_detail: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class EventDiffRecord:
+    diff_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    snapshot_id: str = ""
+    batch_id: str = ""
+    event_signature: str = ""
+    old_event_id: str = ""
+    new_event_id: str = ""
+    change_type: str = ""
+    field_diffs: list = field(default_factory=list)
+    evidence_diffs: list = field(default_factory=list)
+    alert_count_old: int = 0
+    alert_count_new: int = 0
+    has_conflict: bool = False
+    conflict_reason: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return {
+            **asdict(self),
+            "field_diffs": [fd.to_dict() for fd in self.field_diffs],
+            "evidence_diffs": [ed.to_dict() for ed in self.evidence_diffs],
+        }
 
 
 @dataclass

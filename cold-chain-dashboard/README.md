@@ -169,19 +169,56 @@ JSON 导出分成 **3 个独立数组**，适合做数据仓库 / ETL：
 
 ---
 
+## 承运商告警影响分析
+
+### 匹配规则
+
+承运商告警 JSON 导入后，系统会按配置的时间窗口自动匹配超温事件：
+
+- **匹配条件**：同一箱号（`box_id`）下，告警时间落在 `[事件开始时间 - pre_window_minutes, 事件结束时间 + post_window_minutes]` 区间内
+- **时间窗口**：在「阈值配置」页可分别设置事件前窗口（pre）和事件后窗口（post），单位为分钟，默认各 30 分钟
+- **窗口变更生效**：修改后写回 `config.yaml`，重启后依然生效；同一批温度数据重分析时会用新窗口重新计算告警匹配字段
+
+### 派生字段
+
+| 字段 | 含义 | 筛选口径 |
+|------|------|----------|
+| `carrier_alert_count` | 匹配到的承运商告警数量 | `> 0` 视为"有承运商告警"，`= 0` 视为"无告警" |
+| `nearest_alert_time` | 距离事件开始时间最近的一条告警时间 | 用于辅助判断告警是否恰好在超温前后触发 |
+| `carrier` | 所有匹配告警的承运商名称，逗号分隔、去重排序 | 可按承运商做影响面分析 |
+| `alert_types` | 所有匹配告警的告警类型，逗号分隔、去重排序 | 如 `equipment_fault,temperature_exceeded` |
+| `has_carrier_alert` | 布尔派生字段（仅导出），等价于 `carrier_alert_count > 0` | 便于 BI 报表直接筛选 |
+
+### 看板和事件详情筛选
+
+- **异常事件看板**：顶部新增「按承运商告警筛选」下拉框（全部 / 有承运商告警 / 无承运商告警），并显示两类事件数量指标
+- **事件复核**：同样支持按承运商告警筛选，便于优先处理有承运商侧告警的事件
+- **事件详情**：展示承运商告警数量、最近告警时间、承运商、告警类型摘要
+
+### 重分析注意事项
+
+同一批温度数据用新窗口重分析时：
+- ✅ 保留复核状态、处理人、处理备注、关闭时间
+- ✅ 保留责任人分派、截止时间、优先级
+- ✅ 保留全部审计日志
+- ✅ 保留非温度证据（收货备注、承运商告警证据本身不重复生成）
+- 🔄 **承运商告警派生字段会用新窗口重新计算**
+
+---
+
 ## 数据模型（持久化）
 
 详见 `core/models.py`：
 
 | 模型 | 关键字段 |
 |------|----------|
-| `AnomalyEvent` | 见上文事件行字段 |
+| `AnomalyEvent` | 见上文事件行字段（含承运商告警派生字段） |
 | `AuditLog` | `log_id, event_id, action, operator, remark, field_changed, old_value, new_value, timestamp` |
 | `Evidence` | `evidence_id, event_id, evidence_type (温度记录/收货备注/承运商告警), detail, source_file` |
 | `Priority` (enum) | `低 / 中 / 高 / 紧急` |
 | `EventStatus` (enum) | `待处理 / 已确认 / 误报 / 已关闭` |
 
-**旧数据迁移**：应用启动时 `load_events / load_audit_logs` 会自动给缺失字段补默认值（`assignee="" / deadline="" / priority="中" / version=1 / last_updated_at=created_at / field_changed="" / old_value="" / new_value=""`），不破坏已有事件、证据和复核记录。
+**旧数据迁移**：应用启动时 `load_events / load_audit_logs` 会自动给缺失字段补默认值（`assignee="" / deadline="" / priority="中" / version=1 / last_updated_at=created_at / field_changed="" / old_value="" / new_value="" / carrier_alert_count=0 / nearest_alert_time="" / carrier="" / alert_types=""`），不破坏已有事件、证据和复核记录。
 
 ---
 
