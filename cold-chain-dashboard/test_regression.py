@@ -29,6 +29,7 @@ from core.models import (
     ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
     Evidence,
     QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
+    HandoverRecord, HandoverImportBatch, HandoverSkippedRowLog, HandoverUndoRecord,
 )
 from core.persistence import (
     add_events,
@@ -82,6 +83,21 @@ from core.persistence import (
     filter_qc_inspections,
     get_qc_summary,
     QCVersionConflictError,
+    import_handover_csv,
+    save_handover_import,
+    save_handover_records,
+    load_handover_records,
+    load_handover_batches,
+    load_handover_skipped_logs,
+    load_handover_undo_records,
+    get_handovers_for_event,
+    get_handover_skipped_logs_for_batch,
+    get_recent_handovers_for_box,
+    update_handover_remark,
+    undo_last_handover_import,
+    filter_handover_records,
+    get_handover_summary,
+    HandoverVersionConflictError,
 )
 
 
@@ -105,6 +121,14 @@ class TestBase(unittest.TestCase):
                 "post_window_minutes": 30,
             },
             "export": {"default_encoding": "utf-8-sig"},
+            "handover_check": {
+                "required_columns": ["箱号", "交接时间", "交接点", "交接温度", "交接人", "备注"],
+                "time_column": "交接时间",
+                "time_format": "%Y-%m-%d %H:%M:%S",
+                "temperature_lower_limit": -40.0,
+                "temperature_upper_limit": 10.0,
+                "match_window_minutes": 120,
+            },
         }
 
         self.temp_csv_content = """box_id,timestamp,temperature_c
@@ -4300,6 +4324,763 @@ BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
                 event_id = row["event_id"]
                 json_ev = next(e for e in json_payload["events"] if e["event_id"] == event_id)
                 self.assertEqual(int(float(row["qc_inspection_count"])), json_ev["qc_inspection_count"])
+
+
+class TestHandoverImport(TestBase):
+    """Test handover CSV import with validation rules."""
+
+    def _setup_events_for_handover(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-ho-1")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-ho-1", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-ho-1", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+        return events
+
+    def test_import_happy_path_valid_records(self):
+        self._setup_events_for_handover()
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,离仓正常
+BX-001,2025-06-10 09:00:00,门岗B,-18.2,门岗李,到仓签收
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="门岗A"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 2)
+        self.assertEqual(len(skipped), 0)
+        self.assertEqual(ho_batch.valid_count, 2)
+        self.assertEqual(ho_batch.status, "成功")
+
+        for h in handovers:
+            self.assertEqual(h.operator, "门岗A")
+            self.assertEqual(h.version, 1)
+
+    def test_missing_required_column_raises(self):
+        ho_csv_bad = """箱号,交接时间,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,-20.5,司机王,离仓正常
+"""
+        with self.assertRaises(ValueError) as ctx:
+            import_handover_csv(ho_csv_bad.encode(), self.config)
+        self.assertIn("缺少必填列", str(ctx.exception))
+        self.assertIn("交接点", str(ctx.exception))
+
+    def test_invalid_time_format_skipped(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,bad-time,冷藏仓A,-20.5,司机王,离仓正常
+BX-001,2025-06-10 09:00:00,门岗B,-18.2,门岗李,到仓签收
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("时间格式错误", skipped[0].reason)
+        self.assertEqual(skipped[0].handover_time_raw, "bad-time")
+
+    def test_temperature_out_of_range_skipped(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-50.0,司机王,温度超下限
+BX-001,2025-06-10 09:00:00,门岗B,20.0,门岗李,温度超上限
+BX-001,2025-06-10 10:00:00,门岗B,-18.2,门岗李,正常
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 1)
+        self.assertEqual(len(skipped), 2)
+
+        reasons = [s.reason for s in skipped]
+        self.assertTrue(any("温度超出范围" in r for r in reasons))
+        temp_raws = [s.handover_temperature_raw for s in skipped]
+        self.assertIn("-50.0", temp_raws)
+        self.assertIn("20.0", temp_raws)
+
+    def test_duplicate_same_box_same_point_same_time_skipped(self):
+        self._setup_events_for_handover()
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,第一次
+"""
+        handovers1, evidences1, ho_batch1, skipped1 = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op1"
+        )
+        save_handover_import(handovers1, evidences1, ho_batch1, skipped1)
+        self.assertEqual(len(handovers1), 1)
+        self.assertEqual(len(skipped1), 0)
+
+        ho_csv2 = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,第二次重复
+"""
+        handovers2, evidences2, ho_batch2, skipped2 = import_handover_csv(
+            ho_csv2.encode(), self.config, operator="op2"
+        )
+        save_handover_import(handovers2, evidences2, ho_batch2, skipped2)
+        self.assertEqual(len(handovers2), 0)
+        self.assertEqual(len(skipped2), 1)
+        self.assertIn("同箱同交接点同时间重复", skipped2[0].reason)
+        self.assertIn("BX-001", skipped2[0].reason)
+        self.assertIn("2025-06-10 07:30:00", skipped2[0].reason)
+        self.assertIn("冷藏仓A", skipped2[0].reason)
+
+    def test_missing_fields_skipped(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,缺箱号
+BX-002,,冷藏仓A,-20.5,司机王,缺交接时间
+BX-003,2025-06-10 07:30:00,,-20.5,司机王,缺交接点
+BX-004,2025-06-10 07:30:00,冷藏仓A,,司机王,缺交接温度
+BX-005,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,正常行
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 1)
+        self.assertEqual(len(skipped), 4)
+
+        reasons = [s.reason for s in skipped]
+        self.assertIn("缺箱号", reasons)
+        self.assertIn("缺交接时间", reasons)
+        self.assertIn("缺交接点", reasons)
+        self.assertIn("缺交接温度", reasons)
+
+    def test_handover_links_to_existing_event(self):
+        events = self._setup_events_for_handover()
+        bx001_events = [e for e in events if e.box_id == "BX-001"]
+        self.assertGreater(len(bx001_events), 0)
+
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 08:15:00,冷藏仓A,-12.0,司机王,在异常事件窗口内
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="门岗A"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 1)
+        self.assertIsNotNone(handovers[0].event_id)
+        self.assertEqual(handovers[0].box_id, "BX-001")
+
+        linked_event = get_event_by_id(handovers[0].event_id)
+        self.assertIsNotNone(linked_event)
+        self.assertEqual(linked_event.box_id, "BX-001")
+
+        event_handovers = get_handovers_for_event(linked_event.event_id)
+        self.assertEqual(len(event_handovers), 1)
+        self.assertEqual(event_handovers[0].handover_id, handovers[0].handover_id)
+
+    def test_handover_not_linked_when_outside_window(self):
+        self._setup_events_for_handover()
+
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-09 00:00:00,冷藏仓A,-20.5,司机王,太早了
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="门岗A"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        self.assertEqual(len(handovers), 1)
+        self.assertEqual(handovers[0].event_id, "")
+
+
+class TestHandoverRestartPersistence(TestBase):
+    """Test that handover data persists across simulated restarts."""
+
+    def test_records_batches_skipped_undo_persist(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,离仓
+,2025-06-10 09:00:00,门岗B,-18.2,门岗李,到仓
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="门岗A"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        undo_last_handover_import(operator="admin")
+
+        records_after = load_handover_records()
+        batches_after = load_handover_batches()
+        skipped_after = load_handover_skipped_logs()
+        undo_after = load_handover_undo_records()
+
+        self.assertEqual(len(records_after), 0)
+        self.assertEqual(len(batches_after), 0)
+        self.assertEqual(len(skipped_after), 0)
+        self.assertEqual(len(undo_after), 1)
+        self.assertEqual(undo_after[0].operator, "admin")
+
+        new_ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-002,2025-06-10 08:00:00,冷藏仓A,-21.0,司机赵,离仓
+"""
+        handovers2, evidences2, ho_batch2, skipped2 = import_handover_csv(
+            new_ho_csv.encode(), self.config, operator="门岗B"
+        )
+        save_handover_import(handovers2, evidences2, ho_batch2, skipped2)
+
+        records_final = load_handover_records()
+        batches_final = load_handover_batches()
+        skipped_final = load_handover_skipped_logs()
+        undo_final = load_handover_undo_records()
+
+        self.assertEqual(len(records_final), 1)
+        self.assertEqual(records_final[0].box_id, "BX-002")
+        self.assertEqual(len(batches_final), 1)
+        self.assertEqual(len(skipped_final), 0)
+        self.assertEqual(len(undo_final), 1)
+
+
+class TestHandoverFilter(TestBase):
+    """Test filtering handover records by batch, handover point, and linked event status."""
+
+    def _setup_multiple_handovers(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-ho-f")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-ho-f", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-ho-f", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        ho_csv1 = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 08:15:00,冷藏仓A,-12.0,司机王,关联事件
+BX-999,2025-06-10 07:00:00,门岗B,-20.0,门岗李,不关联
+"""
+        handovers1, evidences1, ho_batch1, skipped1 = import_handover_csv(
+            ho_csv1.encode(), self.config, operator="op1"
+        )
+        save_handover_import(handovers1, evidences1, ho_batch1, skipped1)
+        batch_id_1 = ho_batch1.handover_batch_id
+
+        ho_csv2 = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-004,2025-06-10 11:10:00,冷藏仓A,-8.0,司机赵,关联BX004
+BX-888,2025-06-10 12:00:00,配送点C,-19.0,门岗张,不关联
+"""
+        handovers2, evidences2, ho_batch2, skipped2 = import_handover_csv(
+            ho_csv2.encode(), self.config, operator="op2"
+        )
+        save_handover_import(handovers2, evidences2, ho_batch2, skipped2)
+        batch_id_2 = ho_batch2.handover_batch_id
+
+        return batch_id_1, batch_id_2
+
+    def test_filter_by_batch_id(self):
+        b1, b2 = self._setup_multiple_handovers()
+
+        filtered_b1 = filter_handover_records(handover_batch_id=b1)
+        self.assertEqual(len(filtered_b1), 2)
+        for h in filtered_b1:
+            self.assertEqual(h.handover_batch_id, b1)
+
+        filtered_b2 = filter_handover_records(handover_batch_id=b2)
+        self.assertEqual(len(filtered_b2), 2)
+
+    def test_filter_by_handover_point(self):
+        self._setup_multiple_handovers()
+
+        filtered = filter_handover_records(handover_point="冷藏仓A")
+        self.assertEqual(len(filtered), 2)
+        for h in filtered:
+            self.assertEqual(h.handover_point, "冷藏仓A")
+
+        filtered_b = filter_handover_records(handover_point="门岗B")
+        self.assertEqual(len(filtered_b), 1)
+
+    def test_filter_by_has_linked_event(self):
+        self._setup_multiple_handovers()
+
+        linked = filter_handover_records(has_linked_event=True)
+        self.assertEqual(len(linked), 2)
+        for h in linked:
+            self.assertTrue(h.event_id != "")
+
+        unlinked = filter_handover_records(has_linked_event=False)
+        self.assertEqual(len(unlinked), 2)
+        for h in unlinked:
+            self.assertEqual(h.event_id, "")
+
+    def test_filter_combined_batch_and_point(self):
+        b1, _ = self._setup_multiple_handovers()
+
+        filtered = filter_handover_records(
+            handover_batch_id=b1,
+            handover_point="冷藏仓A",
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].box_id, "BX-001")
+
+    def test_filter_point_and_linked(self):
+        self._setup_multiple_handovers()
+
+        filtered = filter_handover_records(
+            handover_point="冷藏仓A",
+            has_linked_event=True,
+        )
+        self.assertEqual(len(filtered), 2)
+        for h in filtered:
+            self.assertEqual(h.handover_point, "冷藏仓A")
+            self.assertTrue(h.event_id != "")
+
+    def test_get_handover_summary_counts(self):
+        self._setup_multiple_handovers()
+        summary = get_handover_summary()
+
+        self.assertEqual(summary["total_handovers"], 4)
+        self.assertEqual(summary["linked_to_events"], 2)
+        self.assertEqual(summary["unlinked"], 2)
+        self.assertEqual(summary["total_batches"], 2)
+        self.assertEqual(summary["total_skipped_rows"], 0)
+        self.assertIn("冷藏仓A", summary["handover_point_counts"])
+        self.assertEqual(summary["handover_point_counts"]["冷藏仓A"], 2)
+
+
+class TestHandoverDetailAssociation(TestBase):
+    """Test handover records shown in event details and recent handovers for box."""
+
+    def test_event_detail_shows_linked_handovers(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-ho-d")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-ho-d", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-ho-d", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        bx001_event = next(e for e in events if e.box_id == "BX-001")
+
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 08:15:00,冷藏仓A,-12.0,司机王,关联BX001
+BX-001,2025-06-10 09:30:00,门岗B,-18.0,门岗李,也关联BX001
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        linked = get_handovers_for_event(bx001_event.event_id)
+        self.assertEqual(len(linked), 2)
+        box_ids = {h.box_id for h in linked}
+        self.assertEqual(box_ids, {"BX-001"})
+
+    def test_get_recent_handovers_for_box(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:00:00,冷藏仓A,-20.0,司机王,最早
+BX-001,2025-06-10 08:00:00,门岗B,-19.0,门岗李,中间
+BX-001,2025-06-10 09:00:00,配送点C,-18.0,司机张,最晚
+BX-002,2025-06-10 10:00:00,冷藏仓A,-21.0,司机赵,其他箱
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        recent = get_recent_handovers_for_box("BX-001", limit=10)
+        self.assertEqual(len(recent), 3)
+        self.assertEqual(recent[0].handover_time, "2025-06-10 09:00:00")
+        self.assertEqual(recent[-1].handover_time, "2025-06-10 07:00:00")
+
+        recent_limited = get_recent_handovers_for_box("BX-001", limit=2)
+        self.assertEqual(len(recent_limited), 2)
+
+        recent_other = get_recent_handovers_for_box("BX-002", limit=10)
+        self.assertEqual(len(recent_other), 1)
+        self.assertEqual(recent_other[0].box_id, "BX-002")
+
+        recent_none = get_recent_handovers_for_box("BX-NOTEXIST", limit=10)
+        self.assertEqual(len(recent_none), 0)
+
+
+class TestHandoverVersionConflict(TestBase):
+    """Test optimistic locking and audit logging for handover remark edits."""
+
+    def test_update_remark_increments_version(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,原始备注
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op1"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        target = handovers[0]
+        original_version = target.version
+
+        success, updated = update_handover_remark(
+            target.handover_id,
+            new_remark="修改后的备注",
+            operator="编辑者A",
+            expected_version=original_version,
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(updated.version, original_version + 1)
+        self.assertEqual(updated.remark, "修改后的备注")
+
+        reloaded = load_handover_records()[0]
+        self.assertEqual(reloaded.version, original_version + 1)
+        self.assertEqual(reloaded.remark, "修改后的备注")
+
+    def test_version_conflict_raises(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,原始
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+        target = handovers[0]
+
+        success, updated = update_handover_remark(
+            target.handover_id,
+            new_remark="第一次修改",
+            operator="编辑者A",
+            expected_version=target.version,
+        )
+        self.assertTrue(success)
+
+        with self.assertRaises(HandoverVersionConflictError) as ctx:
+            update_handover_remark(
+                target.handover_id,
+                new_remark="第二次修改（冲突）",
+                operator="编辑者B",
+                expected_version=target.version,
+            )
+
+        self.assertEqual(ctx.exception.handover_id, target.handover_id)
+        self.assertEqual(ctx.exception.expected_version, target.version)
+        self.assertEqual(ctx.exception.current_version, target.version + 1)
+
+    def test_remark_change_writes_audit_log(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,原始备注
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="导入者"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+        target = handovers[0]
+
+        update_handover_remark(
+            target.handover_id,
+            new_remark="新备注",
+            operator="修改人",
+            expected_version=target.version,
+        )
+
+        all_logs = load_audit_logs()
+        ho_logs = [l for l in all_logs if l.field_changed == "handover_remark"]
+        self.assertGreater(len(ho_logs), 0)
+
+        log = ho_logs[-1]
+        self.assertIn("交接备注变更", log.action)
+        self.assertEqual(log.old_value, "原始备注")
+        self.assertEqual(log.new_value, "新备注")
+        self.assertEqual(log.operator, "修改人")
+
+    def test_no_change_no_audit_log(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,相同备注
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+        target = handovers[0]
+
+        logs_before = len([l for l in load_audit_logs() if l.field_changed == "handover_remark"])
+
+        update_handover_remark(
+            target.handover_id,
+            new_remark="相同备注",
+            operator="修改人",
+            expected_version=target.version,
+        )
+
+        logs_after = len([l for l in load_audit_logs() if l.field_changed == "handover_remark"])
+        self.assertEqual(logs_before, logs_after)
+
+
+class TestHandoverUndoImport(TestBase):
+    """Test undoing the last handover import."""
+
+    def test_undo_removes_last_batch_records(self):
+        ho_csv1 = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,第一批
+"""
+        handovers1, evidences1, ho_batch1, skipped1 = import_handover_csv(
+            ho_csv1.encode(), self.config, operator="op1"
+        )
+        save_handover_import(handovers1, evidences1, ho_batch1, skipped1)
+
+        ho_csv2 = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-002,2025-06-10 08:30:00,门岗B,-18.0,门岗李,第二批
+"""
+        handovers2, evidences2, ho_batch2, skipped2 = import_handover_csv(
+            ho_csv2.encode(), self.config, operator="op2"
+        )
+        save_handover_import(handovers2, evidences2, ho_batch2, skipped2)
+
+        self.assertEqual(len(load_handover_records()), 2)
+        self.assertEqual(len(load_handover_batches()), 2)
+
+        success, count, batch_id = undo_last_handover_import(operator="admin")
+        self.assertTrue(success)
+        self.assertEqual(count, 1)
+        self.assertEqual(batch_id, ho_batch2.handover_batch_id)
+
+        remaining = load_handover_records()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].box_id, "BX-001")
+        self.assertEqual(remaining[0].handover_batch_id, ho_batch1.handover_batch_id)
+
+        self.assertEqual(len(load_handover_batches()), 1)
+        self.assertEqual(len(load_handover_undo_records()), 1)
+
+    def test_undo_writes_audit_logs(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-ho-u")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-ho-u", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-ho-u", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 08:15:00,冷藏仓A,-12.0,司机王,关联事件
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="op"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        undo_last_handover_import(operator="undoer")
+
+        all_logs = load_audit_logs()
+        undo_logs = [l for l in all_logs if "撤销交接导入" in l.action]
+        self.assertGreater(len(undo_logs), 0)
+        self.assertEqual(undo_logs[0].operator, "undoer")
+
+    def test_undo_nothing_when_no_batches(self):
+        success, count, batch_id = undo_last_handover_import(operator="admin")
+        self.assertFalse(success)
+        self.assertEqual(count, 0)
+        self.assertEqual(batch_id, "")
+
+
+class TestHandoverExportFields(TestBase):
+    """Test CSV and JSON exports include handover data."""
+
+    def _setup_events_with_handovers(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-ho-exp")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-ho-exp", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-ho-exp", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 08:15:00,冷藏仓A,-12.0,司机王,关联BX001
+BX-999,2025-06-10 07:00:00,门岗B,-20.0,门岗李,无关联
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config, operator="门岗A"
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        target = handovers[0]
+        update_handover_remark(
+            target.handover_id,
+            new_remark="修改过的备注",
+            operator="编辑者",
+            expected_version=target.version,
+        )
+
+        return events
+
+    def test_csv_export_includes_handover_rows(self):
+        self._setup_events_with_handovers()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        ho_rows = df[df["row_type"] == "交接记录"]
+        self.assertGreater(len(ho_rows), 0)
+
+        required_cols = [
+            "handover_id", "handover_batch_id", "handover_time",
+            "handover_point", "handover_temperature", "handover_person",
+            "handover_remark", "ho_operator", "ho_version",
+        ]
+        for col in required_cols:
+            self.assertIn(col, df.columns, f"CSV missing handover column: {col}")
+
+    def test_csv_export_includes_handover_summary(self):
+        self._setup_events_with_handovers()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        summary_rows = df[df["row_type"] == "交接摘要"]
+        self.assertGreater(len(summary_rows), 0)
+
+        summary = summary_rows.iloc[0]
+        self.assertIn("ho_total_handovers", df.columns)
+        self.assertIn("ho_linked_to_events", df.columns)
+
+    def test_csv_export_includes_handover_skipped_rows(self):
+        ho_csv = """箱号,交接时间,交接点,交接温度,交接人,备注
+,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王,缺箱号被跳过
+"""
+        handovers, evidences, ho_batch, skipped = import_handover_csv(
+            ho_csv.encode(), self.config
+        )
+        save_handover_import(handovers, evidences, ho_batch, skipped)
+
+        from app import build_csv_export
+        events = load_events()
+        csv_content = build_csv_export(events)
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        skipped_rows = df[df["row_type"] == "交接跳过行"]
+        self.assertGreater(len(skipped_rows), 0)
+        self.assertIn("skip_reason", df.columns)
+        self.assertIn("handover_time_raw", df.columns)
+
+    def test_csv_export_includes_handover_undo_records(self):
+        self._setup_events_with_handovers()
+        undo_last_handover_import(operator="admin")
+
+        from app import build_csv_export
+        events = load_events()
+        csv_content = build_csv_export(events)
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        undo_rows = df[df["row_type"] == "交接撤销记录"]
+        self.assertGreater(len(undo_rows), 0)
+        self.assertIn("ho_undo_id", df.columns)
+        self.assertIn("ho_undo_operator", df.columns)
+
+    def test_csv_event_row_has_handover_fields(self):
+        self._setup_events_with_handovers()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        event_rows = df[df["row_type"] == "事件"]
+        self.assertIn("handover_count", event_rows.columns)
+        self.assertIn("handover_summary", event_rows.columns)
+        self.assertIn("handover_remark_conflict", event_rows.columns)
+        self.assertIn("handover_audit_logs", event_rows.columns)
+
+        with_ho = event_rows[event_rows["handover_count"].astype(float).astype(int) > 0]
+        self.assertGreater(len(with_ho), 0)
+
+        conflict_rows = event_rows[event_rows["handover_remark_conflict"].astype(str) == "True"]
+        self.assertGreater(len(conflict_rows), 0)
+
+    def test_json_export_includes_handover_fields(self):
+        self._setup_events_with_handovers()
+        from app import build_json_export
+
+        payload = build_json_export(load_events())
+
+        self.assertIn("handover_summary", payload)
+        self.assertIn("handover_records", payload)
+        self.assertIn("handover_skipped_rows", payload)
+        self.assertIn("handover_undo_records", payload)
+        self.assertIn("handover_import_batches", payload)
+
+        self.assertGreater(len(payload["handover_records"]), 0)
+        self.assertGreater(payload["handover_summary"]["total_handovers"], 0)
+
+        for ev in payload["events"]:
+            self.assertIn("handover_count", ev)
+            self.assertIn("handovers", ev)
+            self.assertIn("handover_remark_conflict", ev)
+            self.assertIn("handover_conflict_logs", ev)
+
+        event_with_ho = [ev for ev in payload["events"] if ev["handover_count"] > 0]
+        self.assertGreater(len(event_with_ho), 0)
+        for ev in event_with_ho:
+            self.assertGreater(len(ev["handovers"]), 0)
+            ho = ev["handovers"][0]
+            self.assertIn("handover_id", ho)
+            self.assertIn("box_id", ho)
+            self.assertIn("handover_point", ho)
+            self.assertIn("handover_temperature", ho)
+            self.assertIn("handover_person", ho)
+
+    def test_json_and_csv_handover_consistent(self):
+        self._setup_events_with_handovers()
+        from app import build_csv_export, build_json_export
+
+        filtered = load_events()
+        csv_content = build_csv_export(filtered)
+        json_payload = build_json_export(filtered)
+
+        csv_df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        csv_ho_rows = csv_df[csv_df["row_type"] == "交接记录"]
+        json_ho = json_payload["handover_records"]
+
+        self.assertEqual(len(csv_ho_rows), len(json_ho))
+
+        csv_event = csv_df[csv_df["row_type"] == "事件"]
+        for _, row in csv_event.iterrows():
+            if int(float(row.get("handover_count", 0))) > 0:
+                event_id = row["event_id"]
+                json_ev = next(e for e in json_payload["events"] if e["event_id"] == event_id)
+                self.assertEqual(int(float(row["handover_count"])), json_ev["handover_count"])
 
 
 if __name__ == "__main__":

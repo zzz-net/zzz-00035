@@ -7,7 +7,7 @@ import pandas as pd
 
 from .models import (
     AnomalyEvent, Evidence, EvidenceType, ImportBatch, EventStatus,
-    SkippedRowLog,
+    SkippedRowLog, HandoverRecord, HandoverImportBatch, HandoverSkippedRowLog,
 )
 
 
@@ -354,3 +354,99 @@ def link_alert_evidence(
             evidences.append(e)
             ev.evidence_ids.append(e.evidence_id)
     return evidences
+
+
+def parse_handover_csv(content: bytes) -> pd.DataFrame:
+    df = pd.read_csv(pd.io.common.BytesIO(content), dtype=str)
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def validate_handover_rows(
+    df: pd.DataFrame,
+    config: dict,
+    handover_batch_id: str = "",
+) -> tuple:
+    handover_config = config.get("handover_check", {})
+    required_columns = handover_config.get(
+        "required_columns",
+        ["箱号", "交接时间", "交接点", "交接温度", "交接人", "备注"]
+    )
+    time_column = handover_config.get("time_column", "交接时间")
+    time_format = handover_config.get("time_format", "%Y-%m-%d %H:%M:%S")
+    temp_lower = float(handover_config.get("temperature_lower_limit", -40.0))
+    temp_upper = float(handover_config.get("temperature_upper_limit", 10.0))
+
+    column_mapping = {
+        "箱号": "box_id",
+        "交接时间": "handover_time",
+        "交接点": "handover_point",
+        "交接温度": "handover_temperature",
+        "交接人": "handover_person",
+        "备注": "remark",
+    }
+
+    valid_records = []
+    skipped_logs = []
+
+    for idx, row in df.iterrows():
+        row_number = int(idx) + 2
+        raw_values = {}
+        for cn_col, model_field in column_mapping.items():
+            raw_values[model_field] = str(row.get(cn_col, "")).strip() if cn_col in df.columns else ""
+
+        box_id = raw_values["box_id"]
+        handover_time_raw = raw_values["handover_time"]
+        handover_point = raw_values["handover_point"]
+        handover_temp_raw = raw_values["handover_temperature"]
+        handover_person = raw_values["handover_person"]
+        remark = raw_values["remark"]
+
+        skip_reason = ""
+
+        if not box_id or box_id == "nan":
+            skip_reason = "缺箱号"
+        elif not handover_time_raw or handover_time_raw == "nan":
+            skip_reason = "缺交接时间"
+        elif not handover_point or handover_point == "nan":
+            skip_reason = "缺交接点"
+        elif not handover_temp_raw or handover_temp_raw == "nan":
+            skip_reason = "缺交接温度"
+        else:
+            try:
+                datetime.strptime(handover_time_raw, time_format)
+            except (ValueError, TypeError):
+                skip_reason = f"时间格式错误: {handover_time_raw}，期望: {time_format}"
+
+        if not skip_reason:
+            try:
+                handover_temp = float(handover_temp_raw)
+                if handover_temp < temp_lower or handover_temp > temp_upper:
+                    skip_reason = f"温度超出范围: {handover_temp_raw}，范围: [{temp_lower}, {temp_upper}]"
+            except ValueError:
+                skip_reason = f"温度值无法解析: {handover_temp_raw}"
+
+        if skip_reason:
+            skipped_logs.append(HandoverSkippedRowLog(
+                handover_batch_id=handover_batch_id,
+                row_number=row_number,
+                reason=skip_reason,
+                box_id=box_id if box_id != "nan" else "",
+                handover_time_raw=handover_time_raw if handover_time_raw != "nan" else "",
+                handover_point_raw=handover_point if handover_point != "nan" else "",
+                handover_temperature_raw=handover_temp_raw if handover_temp_raw != "nan" else "",
+                handover_person_raw=handover_person if handover_person != "nan" else "",
+                remark_raw=remark if remark != "nan" else "",
+            ))
+            continue
+
+        valid_records.append({
+            "box_id": box_id,
+            "handover_time": handover_time_raw,
+            "handover_point": handover_point,
+            "handover_temperature": float(handover_temp_raw),
+            "handover_person": handover_person if handover_person != "nan" else "",
+            "remark": remark if remark != "nan" else "",
+        })
+
+    return valid_records, skipped_logs

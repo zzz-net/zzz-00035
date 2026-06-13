@@ -65,6 +65,20 @@ from core.persistence import (
     filter_qc_inspections,
     get_qc_summary,
     QCVersionConflictError,
+    import_handover_csv,
+    save_handover_import,
+    load_handover_records,
+    load_handover_batches,
+    load_handover_skipped_logs,
+    load_handover_undo_records,
+    get_handovers_for_event,
+    get_handover_skipped_logs_for_batch,
+    get_recent_handovers_for_box,
+    update_handover_remark,
+    undo_last_handover_import,
+    filter_handover_records,
+    get_handover_summary,
+    HandoverVersionConflictError,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +98,7 @@ def save_config(cfg):
 st.set_page_config(page_title="冷链到货温控复盘看板", layout="wide")
 st.title("🧊 冷链到货温控复盘看板")
 
-menu = st.sidebar.radio("导航", ["数据导入", "到货质检抽检", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
+menu = st.sidebar.radio("导航", ["数据导入", "到货质检抽检", "交接温差核对", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
 
 cfg = load_config()
 
@@ -143,6 +157,18 @@ def build_csv_export(events: list) -> str:
         if qi.event_id:
             qc_by_event.setdefault(qi.event_id, []).append(qi)
 
+    all_handover_records = load_handover_records()
+    ho_by_event: Dict[str, list] = {}
+    for h in all_handover_records:
+        if h.event_id:
+            ho_by_event.setdefault(h.event_id, []).append(h)
+
+    all_audit_logs = load_audit_logs()
+    ho_audit_by_event: Dict[str, list] = {}
+    for log in all_audit_logs:
+        if log.field_changed == "handover_remark":
+            ho_audit_by_event.setdefault(log.event_id, []).append(log)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
@@ -153,6 +179,18 @@ def build_csv_export(events: list) -> str:
         qc_summary_str = "; ".join([
             f"{qi.box_id}@{qi.inspection_time}: 外观={qi.appearance_result}, 温度计={qi.thermometer_reading}, 处置={qi.disposal_suggestion}"
             for qi in event_qc
+        ])
+
+        event_ho = ho_by_event.get(e.event_id, [])
+        ho_summary_str = "; ".join([
+            f"{h.box_id}@{h.handover_time}: 交接点={h.handover_point}, 温度={h.handover_temperature}°C, 交接人={h.handover_person}"
+            for h in event_ho
+        ])
+        ho_audit_logs = ho_audit_by_event.get(e.event_id, [])
+        ho_conflict = len(ho_audit_logs) > 0
+        ho_audit_str = "; ".join([
+            f"{log.timestamp}: {log.old_value} -> {log.new_value} (by {log.operator})"
+            for log in ho_audit_logs
         ])
 
         event_dict = e.to_dict()
@@ -169,6 +207,10 @@ def build_csv_export(events: list) -> str:
         event_dict["carrier_alert_count"] = str(int(e.carrier_alert_count))
         event_dict["qc_inspection_count"] = len(event_qc)
         event_dict["qc_inspection_summary"] = qc_summary_str
+        event_dict["handover_count"] = len(event_ho)
+        event_dict["handover_summary"] = ho_summary_str
+        event_dict["handover_remark_conflict"] = ho_conflict
+        event_dict["handover_audit_logs"] = ho_audit_str
         csv_rows.append(event_dict)
 
         for log in get_audit_logs_for_event(e.event_id):
@@ -200,6 +242,23 @@ def build_csv_export(events: list) -> str:
                 "qc_operator": qi.operator,
                 "qc_version": qi.version,
                 "qc_last_updated_at": qi.last_updated_at,
+            })
+
+        for h in event_ho:
+            csv_rows.append({
+                "row_type": "交接记录",
+                "event_id": e.event_id,
+                "box_id": h.box_id,
+                "handover_id": h.handover_id,
+                "handover_batch_id": h.handover_batch_id,
+                "handover_time": h.handover_time,
+                "handover_point": h.handover_point,
+                "handover_temperature": h.handover_temperature,
+                "handover_person": h.handover_person,
+                "handover_remark": h.remark,
+                "ho_operator": h.operator,
+                "ho_version": h.version,
+                "ho_last_updated_at": h.last_updated_at,
             })
 
         for d in event_diffs:
@@ -275,6 +334,61 @@ def build_csv_export(events: list) -> str:
             "inspection_count": ur.inspection_count,
         })
 
+    ho_summary = get_handover_summary()
+    if ho_summary and ho_summary["total_handovers"] > 0:
+        csv_rows.append({
+            "row_type": "交接摘要",
+            "ho_total_handovers": ho_summary["total_handovers"],
+            "ho_linked_to_events": ho_summary["linked_to_events"],
+            "ho_unlinked": ho_summary["unlinked"],
+            "ho_handover_point_counts": json.dumps(ho_summary["handover_point_counts"], ensure_ascii=False),
+            "ho_total_batches": ho_summary["total_batches"],
+            "ho_total_skipped_rows": ho_summary["total_skipped_rows"],
+            "ho_total_undo_records": ho_summary["total_undo_records"],
+        })
+
+    event_ids_set = set(e.event_id for e in events)
+    unlinked_handovers = [h for h in all_handover_records if not h.event_id or h.event_id not in event_ids_set]
+    for h in unlinked_handovers:
+        csv_rows.append({
+            "row_type": "交接记录",
+            "event_id": h.event_id or "",
+            "box_id": h.box_id,
+            "handover_id": h.handover_id,
+            "handover_batch_id": h.handover_batch_id,
+            "handover_time": h.handover_time,
+            "handover_point": h.handover_point,
+            "handover_temperature": h.handover_temperature,
+            "handover_person": h.handover_person,
+            "handover_remark": h.remark,
+            "ho_operator": h.operator,
+            "ho_version": h.version,
+            "ho_last_updated_at": h.last_updated_at,
+        })
+
+    all_ho_skipped = load_handover_skipped_logs()
+    for sl in all_ho_skipped:
+        csv_rows.append({
+            "row_type": "交接跳过行",
+            "handover_batch_id": sl.handover_batch_id,
+            "row_number": sl.row_number,
+            "box_id": sl.box_id,
+            "handover_time_raw": sl.handover_time_raw,
+            "handover_point_raw": sl.handover_point_raw,
+            "skip_reason": sl.reason,
+        })
+
+    all_ho_undo = load_handover_undo_records()
+    for ur in all_ho_undo:
+        csv_rows.append({
+            "row_type": "交接撤销记录",
+            "ho_undo_id": ur.undo_id,
+            "handover_batch_id": ur.handover_batch_id,
+            "ho_undone_at": ur.undone_at,
+            "ho_undo_operator": ur.operator,
+            "handover_count": ur.handover_count,
+        })
+
     df = pd.DataFrame(csv_rows)
     column_order = [
         "row_type", "event_id", "box_id",
@@ -293,6 +407,10 @@ def build_csv_export(events: list) -> str:
         "inspection_id", "qc_batch_id", "inspection_time",
         "appearance_result", "thermometer_reading", "disposal_suggestion",
         "qc_operator", "qc_version", "qc_last_updated_at",
+        "handover_count", "handover_summary", "handover_remark_conflict", "handover_audit_logs",
+        "handover_id", "handover_batch_id", "handover_time", "handover_point",
+        "handover_temperature", "handover_person", "handover_remark",
+        "ho_operator", "ho_version", "ho_last_updated_at",
         "diff_id", "snapshot_id", "change_type",
         "alert_count_old", "alert_count_new",
         "field_changes", "evidence_changes", "diff_timestamp",
@@ -300,8 +418,11 @@ def build_csv_export(events: list) -> str:
         "evidence_changed", "alert_changed", "conflicts",
         "qc_total_inspections", "qc_linked_to_events", "qc_unlinked",
         "qc_appearance_result_counts", "qc_total_skipped_rows", "qc_total_undo_records",
-        "row_number", "inspection_time_raw", "skip_reason",
+        "ho_total_handovers", "ho_linked_to_events", "ho_unlinked",
+        "ho_handover_point_counts", "ho_total_batches", "ho_total_skipped_rows", "ho_total_undo_records",
+        "row_number", "inspection_time_raw", "handover_time_raw", "handover_point_raw", "skip_reason",
         "undo_id", "undone_at", "undo_operator", "inspection_count",
+        "ho_undo_id", "ho_undone_at", "ho_undo_operator", "handover_count",
     ]
     available_cols = [c for c in column_order if c in df.columns]
     df = df[available_cols]
@@ -332,6 +453,18 @@ def build_json_export(events: list) -> dict:
         if qi.event_id:
             qc_by_event.setdefault(qi.event_id, []).append(qi)
 
+    all_handover_records = load_handover_records()
+    ho_by_event: Dict[str, list] = {}
+    for h in all_handover_records:
+        if h.event_id:
+            ho_by_event.setdefault(h.event_id, []).append(h)
+
+    all_audit_logs_all = load_audit_logs()
+    ho_audit_by_event: Dict[str, list] = {}
+    for log in all_audit_logs_all:
+        if log.field_changed == "handover_remark":
+            ho_audit_by_event.setdefault(log.event_id, []).append(log)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
@@ -339,6 +472,14 @@ def build_json_export(events: list) -> dict:
         change_types = sorted(set(d.change_type for d in event_diffs))
 
         event_qc = qc_by_event.get(e.event_id, [])
+        event_ho = ho_by_event.get(e.event_id, [])
+        ho_audit_logs = ho_audit_by_event.get(e.event_id, [])
+        ho_conflict = len(ho_audit_logs) > 0
+        ho_conflict_logs = []
+        for log in ho_audit_logs:
+            log_dict = log.to_dict()
+            log_dict["log_timestamp"] = log_dict.pop("timestamp")
+            ho_conflict_logs.append(log_dict)
 
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
@@ -351,6 +492,10 @@ def build_json_export(events: list) -> dict:
         event_dict["reanalysis_diffs"] = [d.to_dict() for d in event_diffs]
         event_dict["qc_inspection_count"] = len(event_qc)
         event_dict["qc_inspections"] = [qi.to_dict() for qi in event_qc]
+        event_dict["handover_count"] = len(event_ho)
+        event_dict["handovers"] = [h.to_dict() for h in event_ho]
+        event_dict["handover_remark_conflict"] = ho_conflict
+        event_dict["handover_conflict_logs"] = ho_conflict_logs
         export_events.append(event_dict)
 
     evidence_data = []
@@ -377,6 +522,11 @@ def build_json_export(events: list) -> dict:
     qc_undo_records = [ur.to_dict() for ur in load_qc_undo_records()]
     qc_batches = [b.to_dict() for b in load_qc_batches()]
 
+    ho_summary = get_handover_summary()
+    ho_skipped_logs = [sl.to_dict() for sl in load_handover_skipped_logs()]
+    ho_undo_records = [ur.to_dict() for ur in load_handover_undo_records()]
+    ho_batches = [b.to_dict() for b in load_handover_batches()]
+
     return {
         "events": export_events,
         "evidence": evidence_data,
@@ -389,6 +539,11 @@ def build_json_export(events: list) -> dict:
         "qc_skipped_rows": qc_skipped_logs,
         "qc_undo_records": qc_undo_records,
         "qc_import_batches": qc_batches,
+        "handover_summary": ho_summary,
+        "handover_records": [h.to_dict() for h in all_handover_records],
+        "handover_skipped_rows": ho_skipped_logs,
+        "handover_undo_records": ho_undo_records,
+        "handover_import_batches": ho_batches,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -744,6 +899,221 @@ elif menu == "到货质检抽检":
             st.dataframe(pd.DataFrame(undo_rows), use_container_width=True, hide_index=True)
 
 
+elif menu == "交接温差核对":
+    st.header("📋 交接温差核对")
+    st.markdown("上传门岗或司机提交的交接 CSV，追踪箱子离仓、到仓时的温度，自动关联异常事件。")
+
+    tab_import, tab_list, tab_undo = st.tabs(["📥 导入交接", "📊 交接记录", "↩️ 撤销导入"])
+
+    with tab_import:
+        handover_file = st.file_uploader("交接 CSV", type=["csv"], key="handover_csv")
+        ho_operator = st.text_input("上传人/操作人", key="ho_operator")
+
+        with st.expander("CSV 格式要求"):
+            st.markdown("""
+            必填列: 箱号、交接时间、交接点、交接温度、交接人、备注
+
+            交接时间格式: YYYY-MM-DD HH:MM:SS
+
+            温度范围由 config.yaml > handover_check 配置（默认 [-40°C, 10°C]）。
+
+            同箱号+同交接点+同交接时间的重复记录将被跳过。
+            """)
+
+        if st.button("开始导入交接数据", type="primary", key="import_handover"):
+            if not handover_file:
+                st.error("请上传交接 CSV 文件")
+            else:
+                try:
+                    content = handover_file.read()
+                    handovers, evidences, ho_batch, skipped_logs = import_handover_csv(
+                        content, cfg, operator=ho_operator.strip() or "system"
+                    )
+
+                    ho_batch.file_name = handover_file.name
+                    save_handover_import(handovers, evidences, ho_batch, skipped_logs)
+
+                    linked = sum(1 for h in handovers if h.event_id)
+                    st.success(
+                        f"✅ 导入完成: {len(handovers)} 条交接记录, "
+                        f"{linked} 条关联到异常事件, "
+                        f"{len(evidences)} 条交接证据, "
+                        f"跳过 {len(skipped_logs)} 行"
+                    )
+
+                    if skipped_logs:
+                        with st.expander(f"⚠️ 查看 {len(skipped_logs)} 条跳过行", expanded=False):
+                            skip_df = pd.DataFrame([
+                                {
+                                    "行号": l.row_number,
+                                    "箱号": l.box_id,
+                                    "交接时间": l.handover_time_raw,
+                                    "交接点": l.handover_point_raw,
+                                    "跳过原因": l.reason,
+                                }
+                                for l in skipped_logs
+                            ])
+                            st.dataframe(skip_df, use_container_width=True, hide_index=True)
+
+                except ValueError as e:
+                    st.error(f"❌ 导入失败: {e}")
+                except Exception as e:
+                    st.error(f"❌ 导入失败: {e}")
+
+    with tab_list:
+        all_handovers = load_handover_records()
+        all_ho_batches = load_handover_batches()
+
+        if not all_handovers:
+            st.info("暂无交接记录")
+        else:
+            ho_summary = get_handover_summary()
+            col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+            col_h1.metric("总交接记录", ho_summary["total_handovers"])
+            col_h2.metric("关联事件数", ho_summary["linked_to_events"])
+            col_h3.metric("未关联数", ho_summary["unlinked"])
+            col_h4.metric("导入批次", ho_summary["total_batches"])
+
+            st.markdown("---")
+
+            col_hf1, col_hf2, col_hf3 = st.columns(3)
+            with col_hf1:
+                ho_batch_options = ["全部"] + [b.handover_batch_id for b in all_ho_batches]
+                selected_ho_batch = st.selectbox("按导入批次筛选", ho_batch_options, index=0, key="ho_batch_filter")
+            with col_hf2:
+                ho_point_options = ["全部"] + sorted(set(h.handover_point for h in all_handovers if h.handover_point))
+                selected_ho_point = st.selectbox("按交接点筛选", ho_point_options, index=0, key="ho_point_filter")
+            with col_hf3:
+                ho_link_filter = st.selectbox(
+                    "按是否关联异常筛选",
+                    ["全部", "已关联异常", "未关联异常"],
+                    index=0,
+                    key="ho_link_filter",
+                )
+
+            filtered_handovers = filter_handover_records(
+                handover_batch_id="" if selected_ho_batch == "全部" else selected_ho_batch,
+                handover_point="" if selected_ho_point == "全部" else selected_ho_point,
+                has_linked_event=True if ho_link_filter == "已关联异常" else (False if ho_link_filter == "未关联异常" else None),
+            )
+
+            if not filtered_handovers:
+                st.info("无匹配记录")
+            else:
+                st.markdown(f"**共 {len(filtered_handovers)} 条交接记录**")
+                ho_rows = []
+                for h in filtered_handovers:
+                    ho_event_info = ""
+                    if h.event_id:
+                        ev = get_event_by_id(h.event_id)
+                        if ev:
+                            ho_event_info = f"{ev.event_id} ({ev.box_id})"
+                    ho_rows.append({
+                        "箱号": h.box_id,
+                        "交接时间": h.handover_time,
+                        "交接点": h.handover_point,
+                        "交接温度(°C)": h.handover_temperature,
+                        "交接人": h.handover_person,
+                        "备注": h.remark,
+                        "关联事件": ho_event_info,
+                        "上传人": h.operator,
+                        "版本": h.version,
+                        "最后更新": h.last_updated_at,
+                        "交接ID": h.handover_id,
+                    })
+                ho_df = pd.DataFrame(ho_rows)
+                st.dataframe(ho_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            selected_ho_id = st.text_input("输入交接ID修改备注", key="selected_ho_id")
+            if selected_ho_id:
+                all_ho_list = load_handover_records()
+                target_ho = next((h for h in all_ho_list if h.handover_id == selected_ho_id), None)
+                if target_ho:
+                    st.markdown(
+                        f"**箱号:** {target_ho.box_id} | "
+                        f"**交接时间:** {target_ho.handover_time} | "
+                        f"**交接点:** {target_ho.handover_point} | "
+                        f"**当前版本:** {target_ho.version}"
+                    )
+                    new_ho_remark = st.text_area(
+                        "新备注", value=target_ho.remark, key="edit_ho_remark"
+                    )
+                    edit_ho_operator = st.text_input("操作人", key="edit_ho_operator")
+
+                    if "current_ho_version" not in st.session_state or st.session_state.get("current_ho_id") != target_ho.handover_id:
+                        st.session_state.current_ho_id = target_ho.handover_id
+                        st.session_state.current_ho_version = target_ho.version
+
+                    if target_ho.version != st.session_state.current_ho_version:
+                        st.warning(
+                            f"⚠️ 该交接记录已被其他用户更新！当前版本: {target_ho.version}, "
+                            f"您加载的版本: {st.session_state.current_ho_version}。"
+                            "请刷新页面查看最新数据后再操作。"
+                        )
+                        st.session_state.current_ho_version = target_ho.version
+
+                    if st.button("提交备注修改", type="primary", key="submit_ho_edit"):
+                        if not edit_ho_operator.strip():
+                            st.error("请填写操作人")
+                        else:
+                            try:
+                                success, updated_ho = update_handover_remark(
+                                    selected_ho_id,
+                                    new_remark=new_ho_remark,
+                                    operator=edit_ho_operator.strip(),
+                                    expected_version=st.session_state.current_ho_version,
+                                )
+                                if success:
+                                    st.success(f"交接记录 {selected_ho_id} 已更新，版本: {updated_ho.version}")
+                                    st.session_state.current_ho_version = updated_ho.version
+                                    st.rerun()
+                            except HandoverVersionConflictError as e:
+                                st.error(f"❌ {str(e)}")
+                                st.session_state.current_ho_version = e.current_version
+                else:
+                    st.warning("未找到该交接记录")
+
+    with tab_undo:
+        ho_batches = load_handover_batches()
+        ho_undo_records = load_handover_undo_records()
+
+        if not ho_batches:
+            st.info("暂无导入记录可撤销")
+        else:
+            last_ho_batch = ho_batches[-1]
+            st.warning(
+                f"⚠️ 将撤销最近一次交接导入（批次: {last_ho_batch.handover_batch_id}，"
+                f"时间: {last_ho_batch.import_time}，有效记录: {last_ho_batch.valid_count}条）。"
+                f"此操作不可逆。"
+            )
+            ho_undo_operator = st.text_input("操作人", value="admin", key="ho_undo_operator")
+            if st.button("撤销最近一次交接导入", type="primary", key="undo_handover"):
+                if not ho_undo_operator.strip():
+                    st.error("请填写操作人")
+                else:
+                    success, count, ho_batch_id = undo_last_handover_import(operator=ho_undo_operator.strip())
+                    if success:
+                        st.success(f"✅ 撤销成功！已移除 {count} 条交接记录（批次: {ho_batch_id}）")
+                        st.rerun()
+                    else:
+                        st.error("❌ 撤销失败")
+
+        if ho_undo_records:
+            st.markdown("---")
+            st.subheader("撤销历史")
+            ho_undo_rows = []
+            for r in ho_undo_records:
+                ho_undo_rows.append({
+                    "撤销ID": r.undo_id,
+                    "批次ID": r.handover_batch_id,
+                    "撤销时间": r.undone_at,
+                    "操作人": r.operator,
+                    "移除记录数": r.handover_count,
+                })
+            st.dataframe(pd.DataFrame(ho_undo_rows), use_container_width=True, hide_index=True)
+
+
 elif menu == "异常事件看板":
     st.header("异常事件看板")
     events = load_events()
@@ -848,6 +1218,32 @@ elif menu == "异常事件看板":
                             f"外观: {qi.appearance_result} | 温度计: {qi.thermometer_reading} | "
                             f"处置: {qi.disposal_suggestion} | 质检员: {qi.operator} | 版本: {qi.version}"
                         )
+
+                ho_records = get_handovers_for_event(ev.event_id)
+                if ho_records:
+                    st.markdown("**关联交接记录:**")
+                    for h in ho_records:
+                        st.markdown(
+                            f"- 📋 箱号: {h.box_id} | 交接时间: {h.handover_time} | "
+                            f"交接点: {h.handover_point} | 温度: {h.handover_temperature}°C | "
+                            f"交接人: {h.handover_person} | 备注: {h.remark} | 版本: {h.version}"
+                        )
+
+                recent_handovers = get_recent_handovers_for_box(ev.box_id, limit=10)
+                if recent_handovers:
+                    st.markdown("**同箱最近交接记录:**")
+                    recent_rows = []
+                    for rh in recent_handovers:
+                        linked_info = "已关联" if rh.event_id else "未关联"
+                        recent_rows.append({
+                            "交接时间": rh.handover_time,
+                            "交接点": rh.handover_point,
+                            "温度(°C)": rh.handover_temperature,
+                            "交接人": rh.handover_person,
+                            "备注": rh.remark,
+                            "关联状态": linked_info,
+                        })
+                    st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
 
                 log_list = get_audit_logs_for_event(ev.event_id)
                 if log_list:

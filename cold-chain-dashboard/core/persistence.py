@@ -12,6 +12,7 @@ from .models import (
     AnomalyEvent, AuditLog, Evidence, ImportBatch, Priority, SkippedRowLog,
     ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
     QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
+    HandoverRecord, HandoverImportBatch, HandoverSkippedRowLog, HandoverUndoRecord,
 )
 
 _BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "store")
@@ -26,6 +27,10 @@ _QC_INSPECTIONS_FILE = os.path.join(_BASE_DIR, "qc_inspections.json")
 _QC_BATCHES_FILE = os.path.join(_BASE_DIR, "qc_import_batches.json")
 _QC_SKIPPED_FILE = os.path.join(_BASE_DIR, "qc_skipped_rows.json")
 _QC_UNDO_FILE = os.path.join(_BASE_DIR, "qc_undo_records.json")
+_HANDOVER_FILE = os.path.join(_BASE_DIR, "handover_records.json")
+_HANDOVER_BATCHES_FILE = os.path.join(_BASE_DIR, "handover_import_batches.json")
+_HANDOVER_SKIPPED_FILE = os.path.join(_BASE_DIR, "handover_skipped_rows.json")
+_HANDOVER_UNDO_FILE = os.path.join(_BASE_DIR, "handover_undo_records.json")
 
 _lock = threading.Lock()
 
@@ -1506,13 +1511,396 @@ def get_qc_summary() -> Dict[str, Any]:
     }
 
 
+def load_handover_records() -> list[HandoverRecord]:
+    data = _read_json(_HANDOVER_FILE)
+    return [HandoverRecord(**d) for d in data]
+
+
+def save_handover_records(records: list[HandoverRecord]):
+    _write_json(_HANDOVER_FILE, [r.to_dict() for r in records])
+
+
+def load_handover_batches() -> list[HandoverImportBatch]:
+    data = _read_json(_HANDOVER_BATCHES_FILE)
+    return [HandoverImportBatch(**d) for d in data]
+
+
+def save_handover_batches(batches: list[HandoverImportBatch]):
+    _write_json(_HANDOVER_BATCHES_FILE, [b.to_dict() for b in batches])
+
+
+def load_handover_skipped_logs() -> list[HandoverSkippedRowLog]:
+    data = _read_json(_HANDOVER_SKIPPED_FILE)
+    return [HandoverSkippedRowLog(**d) for d in data]
+
+
+def save_handover_skipped_logs(logs: list[HandoverSkippedRowLog]):
+    _write_json(_HANDOVER_SKIPPED_FILE, [l.to_dict() for l in logs])
+
+
+def load_handover_undo_records() -> list[HandoverUndoRecord]:
+    data = _read_json(_HANDOVER_UNDO_FILE)
+    return [HandoverUndoRecord(**d) for d in data]
+
+
+def save_handover_undo_records(records: list[HandoverUndoRecord]):
+    _write_json(_HANDOVER_UNDO_FILE, [r.to_dict() for r in records])
+
+
+def _handover_parse_ts(ts_str: str):
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def _match_handover_to_event(
+    box_id: str,
+    handover_time: str,
+    events: list[AnomalyEvent],
+    window_minutes: int = 120,
+) -> Optional[AnomalyEvent]:
+    ho_dt = _handover_parse_ts(handover_time)
+    if not ho_dt:
+        return None
+    best_event = None
+    best_diff = None
+    for ev in events:
+        if ev.box_id != box_id:
+            continue
+        ev_start = _handover_parse_ts(ev.start_time)
+        ev_end = _handover_parse_ts(ev.end_time)
+        if not ev_start or not ev_end:
+            continue
+        window_start = ev_start - timedelta(minutes=window_minutes)
+        window_end = ev_end + timedelta(minutes=window_minutes)
+        if window_start <= ho_dt <= window_end:
+            diff_start = abs((ho_dt - ev_start).total_seconds())
+            diff_end = abs((ho_dt - ev_end).total_seconds())
+            diff = min(diff_start, diff_end)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_event = ev
+    return best_event
+
+
+def import_handover_csv(
+    content: bytes,
+    config: dict,
+    operator: str = "",
+) -> Tuple[list[HandoverRecord], list[Evidence], HandoverImportBatch, list[HandoverSkippedRowLog]]:
+    from .analyzer import parse_handover_csv, validate_handover_rows
+
+    handover_config = config.get("handover_check", {})
+    required_columns = handover_config.get(
+        "required_columns",
+        ["箱号", "交接时间", "交接点", "交接温度", "交接人", "备注"]
+    )
+    match_window = int(handover_config.get("match_window_minutes", 120))
+
+    df = parse_handover_csv(content)
+    missing_cols = set(required_columns) - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"交接 CSV 缺少必填列: {missing_cols}")
+
+    ho_batch = HandoverImportBatch(
+        file_hash=hashlib.sha256(content).hexdigest(),
+        row_count=len(df),
+    )
+
+    valid_records, skipped_logs = validate_handover_rows(
+        df, config, handover_batch_id=ho_batch.handover_batch_id
+    )
+
+    handovers: list[HandoverRecord] = []
+    evidences: list[Evidence] = []
+    existing_handovers = load_handover_records()
+    existing_keys = {(h.box_id, h.handover_time, h.handover_point) for h in existing_handovers}
+    events = load_events()
+
+    for rec in valid_records:
+        key = (rec["box_id"], rec["handover_time"], rec["handover_point"])
+        if key in existing_keys:
+            skipped_logs.append(HandoverSkippedRowLog(
+                handover_batch_id=ho_batch.handover_batch_id,
+                row_number=0,
+                reason=f"同箱同交接点同时间重复: 箱号={rec['box_id']}, 时间={rec['handover_time']}, 交接点={rec['handover_point']}",
+                box_id=rec["box_id"],
+                handover_time_raw=rec["handover_time"],
+                handover_point_raw=rec["handover_point"],
+                handover_temperature_raw=str(rec["handover_temperature"]),
+                handover_person_raw=rec["handover_person"],
+                remark_raw=rec["remark"],
+            ))
+            continue
+
+        ho = HandoverRecord(
+            box_id=rec["box_id"],
+            handover_time=rec["handover_time"],
+            handover_point=rec["handover_point"],
+            handover_temperature=rec["handover_temperature"],
+            handover_person=rec["handover_person"],
+            remark=rec["remark"],
+            handover_batch_id=ho_batch.handover_batch_id,
+            operator=operator,
+        )
+
+        matched_event = _match_handover_to_event(
+            rec["box_id"], rec["handover_time"], events, match_window
+        )
+        if matched_event:
+            ho.event_id = matched_event.event_id
+            ev = Evidence(
+                event_id=matched_event.event_id,
+                evidence_type=EvidenceType.HANDOVER.value,
+                source_file=f"handover_batch_{ho_batch.handover_batch_id}",
+                box_id=rec["box_id"],
+                timestamp=rec["handover_time"],
+                detail=f"交接点: {rec['handover_point']}, 温度: {rec['handover_temperature']}°C, 交接人: {rec['handover_person']}, 备注: {rec['remark']}",
+            )
+            evidences.append(ev)
+            matched_event.evidence_ids.append(ev.evidence_id)
+            _append_audit_log(
+                load_audit_logs(),
+                matched_event.event_id,
+                action="关联交接记录",
+                operator=operator or "system",
+                remark=f"箱号 {rec['box_id']} 交接时间 {rec['handover_time']} 交接点 {rec['handover_point']}",
+                field_changed="handover_record",
+                old_value="",
+                new_value=ho.handover_id,
+            )
+
+        handovers.append(ho)
+        existing_keys.add(key)
+
+    ho_batch.valid_count = len(handovers)
+    ho_batch.skipped_rows = len(skipped_logs)
+    ho_batch.status = "成功" if handovers else "无有效数据"
+
+    return handovers, evidences, ho_batch, skipped_logs
+
+
+def save_handover_import(
+    handovers: list[HandoverRecord],
+    evidences: list[Evidence],
+    ho_batch: HandoverImportBatch,
+    skipped_logs: list[HandoverSkippedRowLog],
+):
+    with _lock:
+        existing_handovers = load_handover_records()
+        existing_evidence = load_evidence()
+        existing_ho_batches = load_handover_batches()
+        existing_ho_skipped = load_handover_skipped_logs()
+        existing_events = load_events()
+
+        existing_handovers.extend(handovers)
+        existing_evidence.extend(evidences)
+        existing_ho_batches.append(ho_batch)
+        existing_ho_skipped.extend(skipped_logs)
+
+        event_by_id = {e.event_id: e for e in existing_events}
+        for ev_obj in evidences:
+            if ev_obj.event_id in event_by_id:
+                event = event_by_id[ev_obj.event_id]
+                if ev_obj.evidence_id not in event.evidence_ids:
+                    event.evidence_ids.append(ev_obj.evidence_id)
+
+        save_handover_records(existing_handovers)
+        save_evidence(existing_evidence)
+        save_handover_batches(existing_ho_batches)
+        save_handover_skipped_logs(existing_ho_skipped)
+        save_events(existing_events)
+
+
+def get_handovers_for_event(event_id: str) -> list[HandoverRecord]:
+    all_handovers = load_handover_records()
+    return [h for h in all_handovers if h.event_id == event_id]
+
+
+def get_handover_skipped_logs_for_batch(handover_batch_id: str) -> list[HandoverSkippedRowLog]:
+    all_logs = load_handover_skipped_logs()
+    return [l for l in all_logs if l.handover_batch_id == handover_batch_id]
+
+
+def get_recent_handovers_for_box(box_id: str, limit: int = 10) -> list[HandoverRecord]:
+    all_handovers = load_handover_records()
+    box_handovers = [h for h in all_handovers if h.box_id == box_id]
+    box_handovers.sort(key=lambda x: x.handover_time, reverse=True)
+    return box_handovers[:limit]
+
+
+class HandoverVersionConflictError(Exception):
+    def __init__(self, handover_id: str, current_version: int, expected_version: int):
+        self.handover_id = handover_id
+        self.current_version = current_version
+        self.expected_version = expected_version
+        super().__init__(
+            f"交接记录 {handover_id} 已被更新（当前版本: {current_version}, 期望版本: {expected_version}）"
+        )
+
+
+def update_handover_remark(
+    handover_id: str,
+    new_remark: str,
+    operator: str = "",
+    expected_version: int = None,
+) -> Tuple[bool, Optional[HandoverRecord]]:
+    with _lock:
+        handovers = load_handover_records()
+        audit_logs = load_audit_logs()
+        target = None
+        for ho in handovers:
+            if ho.handover_id == handover_id:
+                target = ho
+                break
+
+        if not target:
+            return False, None
+
+        if expected_version is not None and target.version != expected_version:
+            raise HandoverVersionConflictError(handover_id, target.version, expected_version)
+
+        old_remark = target.remark
+        target.remark = new_remark
+        target.version += 1
+        target.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if old_remark != new_remark:
+            _append_audit_log(
+                audit_logs, target.event_id or handover_id,
+                action=f"交接备注变更: {old_remark} -> {new_remark}",
+                operator=operator,
+                field_changed="handover_remark",
+                old_value=old_remark,
+                new_value=new_remark,
+            )
+
+        save_handover_records(handovers)
+        save_audit_logs(audit_logs)
+        return True, target
+
+
+def undo_last_handover_import(operator: str = "system") -> Tuple[bool, int, str]:
+    with _lock:
+        ho_batches = load_handover_batches()
+        if not ho_batches:
+            return False, 0, ""
+
+        last_batch = ho_batches[-1]
+
+        handovers = load_handover_records()
+        to_remove = [h for h in handovers if h.handover_batch_id == last_batch.handover_batch_id]
+        pre_handovers = [h.to_dict() for h in to_remove]
+        remaining_handovers = [h for h in handovers if h.handover_batch_id != last_batch.handover_batch_id]
+
+        evidence_ids_to_remove = set()
+        for ho in to_remove:
+            if ho.event_id:
+                related_evidence = [
+                    e for e in load_evidence()
+                    if e.event_id == ho.event_id
+                    and e.evidence_type == EvidenceType.HANDOVER.value
+                    and e.box_id == ho.box_id
+                    and e.timestamp == ho.handover_time
+                ]
+                evidence_ids_to_remove.update(e.evidence_id for e in related_evidence)
+
+        existing_evidence = load_evidence()
+        remaining_evidence = [e for e in existing_evidence if e.evidence_id not in evidence_ids_to_remove]
+
+        existing_events = load_events()
+        for ev in existing_events:
+            ev.evidence_ids = [eid for eid in ev.evidence_ids if eid not in evidence_ids_to_remove]
+
+        audit_logs = load_audit_logs()
+        for ho in to_remove:
+            if ho.event_id:
+                _append_audit_log(
+                    audit_logs, ho.event_id,
+                    action="撤销交接导入",
+                    operator=operator,
+                    remark=f"撤销批次 {last_batch.handover_batch_id} 的交接记录，箱号 {ho.box_id}",
+                    field_changed="handover_record",
+                    old_value=ho.handover_id,
+                    new_value="",
+                )
+
+        undo_record = HandoverUndoRecord(
+            handover_batch_id=last_batch.handover_batch_id,
+            operator=operator,
+            handover_count=len(to_remove),
+            pre_handovers=pre_handovers,
+        )
+
+        existing_undo = load_handover_undo_records()
+        existing_undo.append(undo_record)
+
+        ho_batches = ho_batches[:-1]
+        existing_ho_skipped = load_handover_skipped_logs()
+        remaining_skipped = [l for l in existing_ho_skipped if l.handover_batch_id != last_batch.handover_batch_id]
+
+        save_handover_records(remaining_handovers)
+        save_evidence(remaining_evidence)
+        save_events(existing_events)
+        save_audit_logs(audit_logs)
+        save_handover_batches(ho_batches)
+        save_handover_skipped_logs(remaining_skipped)
+        save_handover_undo_records(existing_undo)
+
+        return True, len(to_remove), last_batch.handover_batch_id
+
+
+def filter_handover_records(
+    handover_batch_id: str = "",
+    handover_point: str = "",
+    has_linked_event: Optional[bool] = None,
+) -> list[HandoverRecord]:
+    handovers = load_handover_records()
+    if handover_batch_id:
+        handovers = [h for h in handovers if h.handover_batch_id == handover_batch_id]
+    if handover_point:
+        handovers = [h for h in handovers if h.handover_point == handover_point]
+    if has_linked_event is not None:
+        events = load_events()
+        event_ids = {e.event_id for e in events}
+        if has_linked_event:
+            handovers = [h for h in handovers if h.event_id in event_ids]
+        else:
+            handovers = [h for h in handovers if h.event_id not in event_ids or not h.event_id]
+    return handovers
+
+
+def get_handover_summary() -> Dict[str, Any]:
+    handovers = load_handover_records()
+    events = load_events()
+    event_ids = {e.event_id for e in events}
+    linked = sum(1 for h in handovers if h.event_id in event_ids)
+    point_counts: Dict[str, int] = {}
+    for h in handovers:
+        point_counts[h.handover_point] = point_counts.get(h.handover_point, 0) + 1
+    batches = load_handover_batches()
+    skipped = load_handover_skipped_logs()
+    undo_records = load_handover_undo_records()
+    return {
+        "total_handovers": len(handovers),
+        "linked_to_events": linked,
+        "unlinked": len(handovers) - linked,
+        "handover_point_counts": point_counts,
+        "total_batches": len(batches),
+        "total_skipped_rows": len(skipped),
+        "total_undo_records": len(undo_records),
+    }
+
+
 def clear_all_for_test():
     """Only for testing purposes."""
     with _lock:
         for path in [
             _EVENTS_FILE, _EVIDENCE_FILE, _AUDIT_FILE, _BATCHES_FILE,
             _SKIPPED_FILE, _SNAPSHOTS_FILE, _DIFFS_FILE,
-            _QC_INSPECTIONS_FILE, _QC_BATCHES_FILE, _QC_SKIPPED_FILE, _QC_UNDO_FILE
+            _QC_INSPECTIONS_FILE, _QC_BATCHES_FILE, _QC_SKIPPED_FILE, _QC_UNDO_FILE,
+            _HANDOVER_FILE, _HANDOVER_BATCHES_FILE, _HANDOVER_SKIPPED_FILE, _HANDOVER_UNDO_FILE,
         ]:
             if os.path.exists(path):
                 os.remove(path)

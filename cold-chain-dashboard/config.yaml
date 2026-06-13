@@ -31,3 +31,16 @@ qc_inspection:
   time_column: 抽检时间
   time_format: "%Y-%m-%d %H:%M:%S"
   match_window_minutes: 60
+handover_check:
+  required_columns:
+    - 箱号
+    - 交接时间
+    - 交接点
+    - 交接温度
+    - 交接人
+    - 备注
+  time_column: 交接时间
+  time_format: "%Y-%m-%d %H:%M:%S"
+  temperature_lower_limit: -40.0
+  temperature_upper_limit: 10.0
+  match_window_minutes: 120

@@ -24,6 +24,7 @@ class EvidenceType(str, Enum):
     RECEIPT_NOTE = "收货备注"
     CARRIER_ALERT = "承运商告警"
     QC_INSPECTION = "到货质检"
+    HANDOVER = "交接记录"
 
 
 class ChangeType(str, Enum):
@@ -253,6 +254,72 @@ class QCUndoRecord:
     operator: str = ""
     inspection_count: int = 0
     pre_inspections: list = field(default_factory=list)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class HandoverRecord:
+    handover_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    box_id: str = ""
+    handover_time: str = ""
+    handover_point: str = ""
+    handover_temperature: float = 0.0
+    handover_person: str = ""
+    remark: str = ""
+    event_id: str = ""
+    handover_batch_id: str = ""
+    operator: str = ""
+    version: int = 1
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    last_updated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class HandoverImportBatch:
+    handover_batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    import_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    file_name: str = ""
+    file_hash: str = ""
+    row_count: int = 0
+    valid_count: int = 0
+    skipped_rows: int = 0
+    status: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class HandoverSkippedRowLog:
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    handover_batch_id: str = ""
+    row_number: int = 0
+    reason: str = ""
+    box_id: str = ""
+    handover_time_raw: str = ""
+    handover_point_raw: str = ""
+    handover_temperature_raw: str = ""
+    handover_person_raw: str = ""
+    remark_raw: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class HandoverUndoRecord:
+    undo_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    handover_batch_id: str = ""
+    undone_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    operator: str = ""
+    handover_count: int = 0
+    pre_handovers: list = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)

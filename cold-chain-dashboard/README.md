@@ -247,3 +247,205 @@ python -m pytest test_regression.py -v
 - 重分析保留分派字段、跨重启数据恢复
 - **CSV / JSON 导出字段一致性**（审计日志可追溯 + 编码 + 筛选后日志跟随）
 - 状态筛选后导出、事件行完整性、空值填充、README 文档字段一致性
+
+---
+
+## 交接温差核对模块
+
+### 功能概述
+
+通过门岗或司机上传的交接 CSV，追踪箱子在**离仓**和**到仓**时的温度，自动关联已有的异常事件，实现全链路温差核对。
+
+- 左侧导航新增「**交接温差核对**」菜单（三个 Tab：导入交接 / 交接记录 / 撤销导入）
+- 异常事件看板和事件复核页的「事件详情」新增「关联交接记录」和「同箱最近交接记录」
+- 导入规则可通过 `config.yaml > handover_check` 灵活配置
+- 备注修改具备乐观锁版本冲突检测，所有变更写审计日志
+- 所有记录（交接记录、批次、跳过行、撤销记录、审计日志）持久化到 `store/*.json`，**应用重启后自动恢复**
+- CSV / JSON 导出补全交接摘要、交接记录、跳过行、冲突状态、审计日志
+
+---
+
+### 交接 CSV 样例
+
+```csv
+箱号,交接时间,交接点,交接温度,交接人,备注
+BX-001,2025-06-10 07:30:00,冷藏仓A,-20.5,司机王师傅,离仓温度正常
+BX-001,2025-06-10 09:00:00,门岗B,-18.2,门岗李,到仓签收录入
+BX-002,2025-06-10 08:45:00,冷藏仓A,-21.0,司机赵,离仓
+BX-002,2025-06-10 10:15:00,门岗B,-19.5,门岗李,外观完好
+BX-004,2025-06-10 10:30:00,冷藏仓A,-13.0,司机孙,离仓时温度偏高
+BX-004,2025-06-10 12:00:00,门岗B,-8.5,门岗张,温度计显示异常高
+```
+
+---
+
+### 字段含义
+
+| 列名（中文） | 字段名（代码） | 类型 | 必填 | 说明 |
+|--------------|----------------|------|------|------|
+| **箱号** | `box_id` | string | ✅ | 箱子唯一编号，用于关联异常事件 |
+| **交接时间** | `handover_time` | string | ✅ | 格式 `YYYY-MM-DD HH:MM:SS`（可配置），离仓或到仓的实际时间 |
+| **交接点** | `handover_point` | string | ✅ | 交接发生的物理位置，如 `冷藏仓A`、`门岗B`、`配送点C` 等 |
+| **交接温度** | `handover_temperature` | float | ✅ | 交接时读取的箱内温度 (°C)，超过配置上下限将被跳过 |
+| **交接人** | `handover_person` | string | ❌ | 执行交接的人员姓名/工号，如司机、门岗等 |
+| **备注** | `remark` | string | ❌ | 自由文本备注，支持后续人工修改 |
+
+---
+
+### config.yaml 导入规则配置
+
+```yaml
+handover_check:
+  # 必填列（缺失时导入报错）
+  required_columns:
+    - 箱号
+    - 交接时间
+    - 交接点
+    - 交接温度
+    - 交接人
+    - 备注
+
+  # 时间列和格式
+  time_column: "交接时间"
+  time_format: "%Y-%m-%d %H:%M:%S"
+
+  # 温度上下限 (°C)，超出范围的行被跳过
+  temperature_lower_limit: -40.0   # 低于此温度视为无效
+  temperature_upper_limit: 10.0    # 高于此温度视为无效
+
+  # 与异常事件匹配的时间窗口（分钟）
+  # 交接时间落在 [事件开始 - window, 事件结束 + window] 区间内自动关联
+  match_window_minutes: 120
+```
+
+---
+
+### 校验规则与跳过行
+
+导入时**逐行校验**，不满足的行写入 `store/handover_skipped_rows.json`，每条跳过行都带明确原因：
+
+| 跳过原因 | 触发条件 |
+|----------|----------|
+| `缺箱号` | 箱号为空 |
+| `缺交接时间` | 交接时间为空 |
+| `缺交接点` | 交接点为空 |
+| `缺交接温度` | 交接温度为空 |
+| `时间格式错误: {raw}，期望: {format}` | 交接时间无法按 `time_format` 解析 |
+| `温度超出范围: {raw}，范围: [{lower}, {upper}]` | 温度低于下限或高于上限 |
+| `温度值无法解析: {raw}` | 温度列不是合法数字 |
+| `同箱同交接点同时间重复: 箱号={bid}, 时间={t}, 交接点={p}` | 同一 (箱号, 交接时间, 交接点) 组合已存在（跨批次去重） |
+
+---
+
+### 页面功能
+
+#### 📥 Tab1：导入交接
+- **CSV 上传** + 操作人填写
+- 点击「开始导入交接数据」后：
+  - 校验缺列 → 缺必填列直接报错并终止
+  - 逐行校验 → 跳过行带原因落盘
+  - 去重 → 同箱同交接点同时间的重复记录被跳过
+  - 事件关联 → 交接时间在异常事件 ±match_window 内的自动关联
+  - 关联成功的写入证据（`EvidenceType.HANDOVER`）和审计日志
+- 导入结果展示：有效记录数 / 关联事件数 / 证据数 / 跳过行数，支持展开查看跳过行
+
+#### 📊 Tab2：交接记录
+- **顶部指标**：总记录数、关联事件数、未关联数、导入批次数
+- **三维筛选**（支持组合）：
+  - 按**导入批次**筛选
+  - 按**交接点**筛选
+  - 按**是否命中现有异常**筛选（全部 / 已关联异常 / 未关联异常）
+- **列表展示**：箱号、交接时间、交接点、温度、交接人、备注、关联事件、上传人、版本等
+- **备注编辑**：输入交接 ID → 加载当前值和版本 → 修改 → 提交
+  - 提交时带 `expected_version` 做乐观锁校验
+  - 若版本冲突 → 弹出 `HandoverVersionConflictError`，提示当前版本和期望版本
+  - 成功后 `version += 1`，写入审计日志（`field_changed = "handover_remark"`）
+
+#### ↩️ Tab3：撤销导入
+- 可撤销**最近一次**交接导入批次（删除对应交接记录、交接证据、跳过行、批次记录）
+- 写入「撤销交接导入」审计日志
+- 展示完整「撤销历史」（撤销ID、批次ID、时间、操作人、移除记录数）
+
+#### 📋 异常事件详情 - 新增交接区块
+在「关联质检抽检」之后新增：
+1. **关联交接记录**（bullet 列表）：直接关联到该事件的交接记录
+2. **同箱最近交接记录**（表格 DataFrame）：按时间倒序的最近 10 条同箱交接，含温度、交接点、关联状态
+
+---
+
+### 导出字段补全（CSV / JSON）
+
+#### CSV 新增行类型
+
+| row_type | 说明 | 有效列 |
+|----------|------|--------|
+| `交接记录` | 每条交接 = 1 行（关联事件的跟着事件走，未关联的在末尾） | `handover_id, handover_batch_id, handover_time, handover_point, handover_temperature, handover_person, handover_remark, ho_operator, ho_version, ho_last_updated_at` |
+| `交接摘要` | 全局统计汇总 = 1 行 | `ho_total_handovers, ho_linked_to_events, ho_unlinked, ho_handover_point_counts, ho_total_batches, ho_total_skipped_rows, ho_total_undo_records` |
+| `交接跳过行` | 每条跳过记录 = 1 行 | `handover_batch_id, row_number, box_id, handover_time_raw, handover_point_raw, skip_reason` |
+| `交接撤销记录` | 每次撤销 = 1 行 | `ho_undo_id, handover_batch_id, ho_undone_at, ho_undo_operator, handover_count` |
+
+#### CSV 事件行新增交接字段
+
+| 新增列 | 类型 | 含义 |
+|--------|------|------|
+| `handover_count` | int | 关联到此事件的交接记录数量 |
+| `handover_summary` | string | 摘要字符串：`{箱号}@{时间}: 交接点={p}, 温度={t}°C, 交接人={name}; ...` |
+| `handover_remark_conflict` | bool | 是否存在交接备注变更（用于检测冲突） |
+| `handover_audit_logs` | string | 交接备注变更的审计日志摘要：`{时间}: {旧值} -> {新值} (by {操作人}); ...` |
+
+#### JSON 新增顶层键
+
+```jsonc
+{
+  "events": [
+    {
+      // ...原有事件字段...
+      "handover_count": 2,
+      "handovers": [ /* 关联的 HandoverRecord 数组 */ ],
+      "handover_remark_conflict": true,
+      "handover_conflict_logs": [ /* 交接备注变更的审计日志数组 */ ]
+    }
+  ],
+  // ...原有导出字段...
+  "handover_summary": {
+    "total_handovers": 50,
+    "linked_to_events": 32,
+    "unlinked": 18,
+    "handover_point_counts": {"冷藏仓A": 25, "门岗B": 25},
+    "total_batches": 3,
+    "total_skipped_rows": 5,
+    "total_undo_records": 1
+  },
+  "handover_records":       [ /* 全部 HandoverRecord */ ],
+  "handover_skipped_rows":  [ /* 全部 HandoverSkippedRowLog */ ],
+  "handover_undo_records":  [ /* 全部 HandoverUndoRecord */ ],
+  "handover_import_batches":[ /* 全部 HandoverImportBatch */ ]
+}
+```
+
+---
+
+### 验证方法（自测 / 联调）
+
+1. **CSV 格式验证**：用 README 样例 CSV 导入，观察跳过行
+2. **缺列测试**：删掉「交接点」列重导入，预期报错「缺少必填列」
+3. **温度超限测试**：改温度为 `-50`（超下限）或 `20`（超上限），预期跳过并带「温度超出范围」原因
+4. **重复记录测试**：相同箱号/时间/交接点导入两次，第二次预期跳过
+5. **关联测试**：温度 CSV 生成异常事件 → 导入交接 CSV（交接时间在事件窗口内）→ 查看事件详情确认关联
+6. **冲突测试**：打开两个浏览器会话改同一条备注 → 第二个提交预期触发 `HandoverVersionConflictError`
+7. **重启恢复测试**：导入后关掉 streamlit 再启动 → 交接记录、跳过行、撤销记录、审计日志仍然存在
+8. **导出验证**：CSV 用 Excel 打开确认 UTF-8-BOM 中文正常；JSON 检查 `handover_summary`、`handover_records`、事件内 `handovers` 都非空
+9. **筛选测试**：在「交接记录」Tab 按批次、交接点、是否关联异常分别筛选，确认列表正确过滤
+
+---
+
+### 数据模型一览（persistence store）
+
+| store 文件 | 模型类 | 主键 / 索引 |
+|------------|--------|-------------|
+| `handover_records.json` | `HandoverRecord` | `handover_id`（12位 hex）；去重键 `(box_id, handover_time, handover_point)` |
+| `handover_import_batches.json` | `HandoverImportBatch` | `handover_batch_id` |
+| `handover_skipped_rows.json` | `HandoverSkippedRowLog` | `log_id`；关联 `handover_batch_id` |
+| `handover_undo_records.json` | `HandoverUndoRecord` | `undo_id`；关联 `handover_batch_id` |
+
+以上文件全部在 `store/` 目录下，应用重启时自动从 JSON 恢复（读取 → 迁移默认值 → 内存对象）。
