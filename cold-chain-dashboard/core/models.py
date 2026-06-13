@@ -23,6 +23,7 @@ class EvidenceType(str, Enum):
     TEMPERATURE_RECORD = "温度记录"
     RECEIPT_NOTE = "收货备注"
     CARRIER_ALERT = "承运商告警"
+    QC_INSPECTION = "到货质检"
 
 
 class ChangeType(str, Enum):
@@ -188,6 +189,70 @@ class SkippedRowLog:
     timestamp_raw: str = ""
     temperature_raw: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class QCInspection:
+    inspection_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    box_id: str = ""
+    inspection_time: str = ""
+    appearance_result: str = ""
+    thermometer_reading: str = ""
+    disposal_suggestion: str = ""
+    event_id: str = ""
+    qc_batch_id: str = ""
+    operator: str = ""
+    version: int = 1
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    last_updated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class QCImportBatch:
+    qc_batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    import_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    file_name: str = ""
+    file_hash: str = ""
+    row_count: int = 0
+    valid_count: int = 0
+    skipped_rows: int = 0
+    status: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class QCSkippedRowLog:
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    qc_batch_id: str = ""
+    row_number: int = 0
+    reason: str = ""
+    box_id: str = ""
+    inspection_time_raw: str = ""
+    appearance_result_raw: str = ""
+    thermometer_reading_raw: str = ""
+    disposal_suggestion_raw: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class QCUndoRecord:
+    undo_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    qc_batch_id: str = ""
+    undone_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    operator: str = ""
+    inspection_count: int = 0
+    pre_inspections: list = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)

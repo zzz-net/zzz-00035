@@ -52,6 +52,19 @@ from core.persistence import (
     get_latest_snapshot_for_raw_data,
     rollback_last_reanalysis,
     ChangeType,
+    import_qc_csv,
+    save_qc_import,
+    load_qc_inspections,
+    load_qc_batches,
+    load_qc_skipped_logs,
+    load_qc_undo_records,
+    get_qc_inspections_for_event,
+    get_qc_skipped_logs_for_batch,
+    update_qc_inspection,
+    undo_last_qc_import,
+    filter_qc_inspections,
+    get_qc_summary,
+    QCVersionConflictError,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +84,7 @@ def save_config(cfg):
 st.set_page_config(page_title="冷链到货温控复盘看板", layout="wide")
 st.title("🧊 冷链到货温控复盘看板")
 
-menu = st.sidebar.radio("导航", ["数据导入", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
+menu = st.sidebar.radio("导航", ["数据导入", "到货质检抽检", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
 
 cfg = load_config()
 
@@ -107,10 +120,6 @@ def _is_overdue(deadline: str) -> bool:
 
 
 def build_csv_export(events: list) -> str:
-    """生成 CSV 字符串内容（UTF-8）。
-    返回 str 而非 bytes，编码由调用方控制（页面端固定 UTF-8-SIG 带 BOM，
-    便于 Excel 直接打开中文），避免内部对 StringIO 传 encoding 参数无效。
-    """
     csv_rows = []
     event_ids = [e.event_id for e in events]
     all_diffs = load_diffs() if events else []
@@ -128,11 +137,23 @@ def build_csv_export(events: list) -> str:
 
     total_diff_summary = get_diff_summary() if events else {}
 
+    all_qc_inspections = load_qc_inspections()
+    qc_by_event: Dict[str, list] = {}
+    for qi in all_qc_inspections:
+        if qi.event_id:
+            qc_by_event.setdefault(qi.event_id, []).append(qi)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
         conflict_reason = "; ".join([d.conflict_reason for d in event_diffs if d.has_conflict])
         change_types = sorted(set(d.change_type for d in event_diffs))
+
+        event_qc = qc_by_event.get(e.event_id, [])
+        qc_summary_str = "; ".join([
+            f"{qi.box_id}@{qi.inspection_time}: 外观={qi.appearance_result}, 温度计={qi.thermometer_reading}, 处置={qi.disposal_suggestion}"
+            for qi in event_qc
+        ])
 
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
@@ -146,6 +167,8 @@ def build_csv_export(events: list) -> str:
         event_dict["duration_minutes"] = str(int(e.duration_minutes))
         event_dict["version"] = str(int(e.version))
         event_dict["carrier_alert_count"] = str(int(e.carrier_alert_count))
+        event_dict["qc_inspection_count"] = len(event_qc)
+        event_dict["qc_inspection_summary"] = qc_summary_str
         csv_rows.append(event_dict)
 
         for log in get_audit_logs_for_event(e.event_id):
@@ -161,6 +184,22 @@ def build_csv_export(events: list) -> str:
                 "operator": log.operator,
                 "log_timestamp": log.timestamp,
                 "remark": log.remark,
+            })
+
+        for qi in event_qc:
+            csv_rows.append({
+                "row_type": "质检抽检",
+                "event_id": e.event_id,
+                "box_id": qi.box_id,
+                "inspection_id": qi.inspection_id,
+                "qc_batch_id": qi.qc_batch_id,
+                "inspection_time": qi.inspection_time,
+                "appearance_result": qi.appearance_result,
+                "thermometer_reading": qi.thermometer_reading,
+                "disposal_suggestion": qi.disposal_suggestion,
+                "qc_operator": qi.operator,
+                "qc_version": qi.version,
+                "qc_last_updated_at": qi.last_updated_at,
             })
 
         for d in event_diffs:
@@ -202,6 +241,40 @@ def build_csv_export(events: list) -> str:
             "conflicts": total_diff_summary["conflicts"],
         })
 
+    qc_summary = get_qc_summary()
+    if qc_summary and qc_summary["total_inspections"] > 0:
+        csv_rows.append({
+            "row_type": "质检摘要",
+            "qc_total_inspections": qc_summary["total_inspections"],
+            "qc_linked_to_events": qc_summary["linked_to_events"],
+            "qc_unlinked": qc_summary["unlinked"],
+            "qc_appearance_result_counts": json.dumps(qc_summary["appearance_result_counts"], ensure_ascii=False),
+            "qc_total_skipped_rows": qc_summary["total_skipped_rows"],
+            "qc_total_undo_records": qc_summary["total_undo_records"],
+        })
+
+    all_qc_skipped = load_qc_skipped_logs()
+    for sl in all_qc_skipped:
+        csv_rows.append({
+            "row_type": "质检跳过行",
+            "qc_batch_id": sl.qc_batch_id,
+            "row_number": sl.row_number,
+            "box_id": sl.box_id,
+            "inspection_time_raw": sl.inspection_time_raw,
+            "skip_reason": sl.reason,
+        })
+
+    all_qc_undo = load_qc_undo_records()
+    for ur in all_qc_undo:
+        csv_rows.append({
+            "row_type": "质检撤销记录",
+            "undo_id": ur.undo_id,
+            "qc_batch_id": ur.qc_batch_id,
+            "undone_at": ur.undone_at,
+            "undo_operator": ur.operator,
+            "inspection_count": ur.inspection_count,
+        })
+
     df = pd.DataFrame(csv_rows)
     column_order = [
         "row_type", "event_id", "box_id",
@@ -216,11 +289,19 @@ def build_csv_export(events: list) -> str:
         "batch_id", "raw_data_hash", "config_signature", "event_signature",
         "evidence_ids",
         "has_conflict", "conflict_reason", "change_types", "reanalysis_count",
+        "qc_inspection_count", "qc_inspection_summary",
+        "inspection_id", "qc_batch_id", "inspection_time",
+        "appearance_result", "thermometer_reading", "disposal_suggestion",
+        "qc_operator", "qc_version", "qc_last_updated_at",
         "diff_id", "snapshot_id", "change_type",
         "alert_count_old", "alert_count_new",
         "field_changes", "evidence_changes", "diff_timestamp",
         "total_diffs", "added", "removed", "field_changed",
         "evidence_changed", "alert_changed", "conflicts",
+        "qc_total_inspections", "qc_linked_to_events", "qc_unlinked",
+        "qc_appearance_result_counts", "qc_total_skipped_rows", "qc_total_undo_records",
+        "row_number", "inspection_time_raw", "skip_reason",
+        "undo_id", "undone_at", "undo_operator", "inspection_count",
     ]
     available_cols = [c for c in column_order if c in df.columns]
     df = df[available_cols]
@@ -245,11 +326,19 @@ def build_json_export(events: list) -> dict:
         if d.new_event_id and d.new_event_id != d.old_event_id:
             diff_by_event.setdefault(d.new_event_id, []).append(d)
 
+    all_qc_inspections = load_qc_inspections()
+    qc_by_event: Dict[str, list] = {}
+    for qi in all_qc_inspections:
+        if qi.event_id:
+            qc_by_event.setdefault(qi.event_id, []).append(qi)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
         conflict_reason = "; ".join([d.conflict_reason for d in event_diffs if d.has_conflict])
         change_types = sorted(set(d.change_type for d in event_diffs))
+
+        event_qc = qc_by_event.get(e.event_id, [])
 
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
@@ -260,6 +349,8 @@ def build_json_export(events: list) -> dict:
         event_dict["change_types"] = change_types
         event_dict["reanalysis_count"] = len(event_diffs)
         event_dict["reanalysis_diffs"] = [d.to_dict() for d in event_diffs]
+        event_dict["qc_inspection_count"] = len(event_qc)
+        event_dict["qc_inspections"] = [qi.to_dict() for qi in event_qc]
         export_events.append(event_dict)
 
     evidence_data = []
@@ -281,6 +372,10 @@ def build_json_export(events: list) -> dict:
     ]
 
     total_diff_summary = get_diff_summary() if events else {}
+    qc_summary = get_qc_summary()
+    qc_skipped_logs = [sl.to_dict() for sl in load_qc_skipped_logs()]
+    qc_undo_records = [ur.to_dict() for ur in load_qc_undo_records()]
+    qc_batches = [b.to_dict() for b in load_qc_batches()]
 
     return {
         "events": export_events,
@@ -289,6 +384,11 @@ def build_json_export(events: list) -> dict:
         "reanalysis_diffs": [d.to_dict() for d in relevant_diffs],
         "reanalysis_snapshots": relevant_snapshots,
         "diff_summary": total_diff_summary,
+        "qc_summary": qc_summary,
+        "qc_inspections": [qi.to_dict() for qi in all_qc_inspections],
+        "qc_skipped_rows": qc_skipped_logs,
+        "qc_undo_records": qc_undo_records,
+        "qc_import_batches": qc_batches,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -452,6 +552,198 @@ if menu == "数据导入":
                 st.error(f"❌ 导入失败: {e}")
 
 
+elif menu == "到货质检抽检":
+    st.header("🔍 到货质检抽检")
+    st.markdown("上传质检员抽检 CSV，系统将自动关联到现有异常事件和批次记录。")
+
+    tab_import, tab_list, tab_undo = st.tabs(["📋 导入抽检", "📊 抽检记录", "↩️ 撤销导入"])
+
+    with tab_import:
+        qc_file = st.file_uploader("抽检 CSV", type=["csv"], key="qc_csv")
+        operator = st.text_input("质检员/操作人")
+
+        with st.expander("CSV 格式要求"):
+            st.markdown("""
+            必填列: 箱号、抽检时间、外观结果、温度计读数、处置建议
+
+            抽检时间格式: YYYY-MM-DD HH:MM:SS
+
+            同箱号+同抽检时间的重复记录将被跳过。
+            """)
+
+        if st.button("开始导入抽检数据", type="primary"):
+            if not qc_file:
+                st.error("请上传抽检 CSV 文件")
+            else:
+                try:
+                    content = qc_file.read()
+                    inspections, evidences, qc_batch, skipped_logs = import_qc_csv(
+                        content, cfg, operator=operator.strip() or "system"
+                    )
+
+                    qc_batch.file_name = qc_file.name
+                    save_qc_import(inspections, evidences, qc_batch, skipped_logs)
+
+                    linked = sum(1 for i in inspections if i.event_id)
+                    st.success(
+                        f"✅ 导入完成: {len(inspections)} 条抽检记录, "
+                        f"{linked} 条关联到异常事件, "
+                        f"{len(evidences)} 条质检证据, "
+                        f"跳过 {len(skipped_logs)} 行"
+                    )
+
+                    if skipped_logs:
+                        with st.expander(f"⚠️ 查看 {len(skipped_logs)} 条跳过行", expanded=False):
+                            skip_df = pd.DataFrame([
+                                {
+                                    "行号": l.row_number,
+                                    "箱号": l.box_id,
+                                    "抽检时间": l.inspection_time_raw,
+                                    "跳过原因": l.reason,
+                                }
+                                for l in skipped_logs
+                            ])
+                            st.dataframe(skip_df, use_container_width=True, hide_index=True)
+
+                except ValueError as e:
+                    st.error(f"❌ 导入失败: {e}")
+                except Exception as e:
+                    st.error(f"❌ 导入失败: {e}")
+
+    with tab_list:
+        all_inspections = load_qc_inspections()
+        all_qc_batches = load_qc_batches()
+
+        if not all_inspections:
+            st.info("暂无抽检记录")
+        else:
+            summary = get_qc_summary()
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            col_s1.metric("总抽检记录", summary["total_inspections"])
+            col_s2.metric("关联事件数", summary["linked_to_events"])
+            col_s3.metric("未关联数", summary["unlinked"])
+            col_s4.metric("导入批次", summary["total_batches"])
+
+            st.markdown("---")
+
+            col_f1, col_f2, col_f3 = st.columns(3)
+            with col_f1:
+                batch_options = ["全部"] + [b.qc_batch_id for b in all_qc_batches]
+                selected_batch = st.selectbox("按导入批次筛选", batch_options, index=0)
+            with col_f2:
+                alert_filter_qc = st.selectbox(
+                    "按承运商告警筛选",
+                    ["全部", "有承运商告警", "无承运商告警"],
+                    index=0,
+                )
+            with col_f3:
+                appearance_options = ["全部"] + sorted(set(i.appearance_result for i in all_inspections if i.appearance_result))
+                selected_appearance = st.selectbox("按外观结果筛选", appearance_options, index=0)
+
+            filtered = filter_qc_inspections(
+                batch_id="" if selected_batch == "全部" else selected_batch,
+                has_carrier_alert=True if alert_filter_qc == "有承运商告警" else (False if alert_filter_qc == "无承运商告警" else None),
+                appearance_result="" if selected_appearance == "全部" else selected_appearance,
+            )
+
+            if not filtered:
+                st.info("无匹配记录")
+            else:
+                st.markdown(f"**共 {len(filtered)} 条抽检记录**")
+                rows = []
+                for i in filtered:
+                    event_info = ""
+                    if i.event_id:
+                        ev = get_event_by_id(i.event_id)
+                        if ev:
+                            event_info = f"{ev.event_id} ({ev.box_id})"
+                    rows.append({
+                        "箱号": i.box_id,
+                        "抽检时间": i.inspection_time,
+                        "外观结果": i.appearance_result,
+                        "温度计读数": i.thermometer_reading,
+                        "处置建议": i.disposal_suggestion,
+                        "关联事件": event_info,
+                        "质检员": i.operator,
+                        "版本": i.version,
+                        "最后更新": i.last_updated_at,
+                    })
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            selected_insp_id = st.text_input("输入抽检记录ID修改结论")
+            if selected_insp_id:
+                all_insp = load_qc_inspections()
+                target_insp = next((i for i in all_insp if i.inspection_id == selected_insp_id), None)
+                if target_insp:
+                    st.markdown(f"**箱号:** {target_insp.box_id} | **抽检时间:** {target_insp.inspection_time} | **当前版本:** {target_insp.version}")
+                    new_appearance = st.text_input("外观结果", value=target_insp.appearance_result, key="edit_appearance")
+                    new_thermo = st.text_input("温度计读数", value=target_insp.thermometer_reading, key="edit_thermo")
+                    new_disposal = st.text_input("处置建议", value=target_insp.disposal_suggestion, key="edit_disposal")
+                    edit_operator = st.text_input("操作人", key="edit_qc_operator")
+
+                    if st.button("提交修改", type="primary", key="submit_qc_edit"):
+                        if not edit_operator.strip():
+                            st.error("请填写操作人")
+                        else:
+                            try:
+                                success, updated = update_qc_inspection(
+                                    selected_insp_id,
+                                    appearance_result=new_appearance,
+                                    thermometer_reading=new_thermo,
+                                    disposal_suggestion=new_disposal,
+                                    operator=edit_operator.strip(),
+                                    expected_version=target_insp.version,
+                                )
+                                if success:
+                                    st.success(f"抽检记录 {selected_insp_id} 已更新，版本: {updated.version}")
+                                    st.rerun()
+                            except QCVersionConflictError as e:
+                                st.error(f"❌ {str(e)}")
+                else:
+                    st.warning("未找到该抽检记录")
+
+    with tab_undo:
+        qc_batches = load_qc_batches()
+        undo_records = load_qc_undo_records()
+
+        if not qc_batches:
+            st.info("暂无导入记录可撤销")
+        else:
+            last_batch = qc_batches[-1]
+            st.warning(
+                f"⚠️ 将撤销最近一次质检导入（批次: {last_batch.qc_batch_id}，"
+                f"时间: {last_batch.import_time}，有效记录: {last_batch.valid_count}条）。"
+                f"此操作不可逆。"
+            )
+            undo_operator = st.text_input("操作人", value="admin", key="qc_undo_operator")
+            if st.button("撤销最近一次质检导入", type="primary"):
+                if not undo_operator.strip():
+                    st.error("请填写操作人")
+                else:
+                    success, count, batch_id = undo_last_qc_import(operator=undo_operator.strip())
+                    if success:
+                        st.success(f"✅ 撤销成功！已移除 {count} 条抽检记录（批次: {batch_id}）")
+                        st.rerun()
+                    else:
+                        st.error("❌ 撤销失败")
+
+        if undo_records:
+            st.markdown("---")
+            st.subheader("撤销历史")
+            undo_rows = []
+            for r in undo_records:
+                undo_rows.append({
+                    "撤销ID": r.undo_id,
+                    "批次ID": r.qc_batch_id,
+                    "撤销时间": r.undone_at,
+                    "操作人": r.operator,
+                    "移除记录数": r.inspection_count,
+                })
+            st.dataframe(pd.DataFrame(undo_rows), use_container_width=True, hide_index=True)
+
+
 elif menu == "异常事件看板":
     st.header("异常事件看板")
     events = load_events()
@@ -546,6 +838,17 @@ elif menu == "异常事件看板":
                     st.markdown("**来源证据:**")
                     for e in ev_list:
                         st.markdown(f"- [{e.evidence_type}] {e.detail} (来源: {e.source_file}, 时间: {e.timestamp})")
+
+                qc_inspections = get_qc_inspections_for_event(ev.event_id)
+                if qc_inspections:
+                    st.markdown("**关联质检抽检:**")
+                    for qi in qc_inspections:
+                        st.markdown(
+                            f"- 🔍 箱号: {qi.box_id} | 抽检时间: {qi.inspection_time} | "
+                            f"外观: {qi.appearance_result} | 温度计: {qi.thermometer_reading} | "
+                            f"处置: {qi.disposal_suggestion} | 质检员: {qi.operator} | 版本: {qi.version}"
+                        )
+
                 log_list = get_audit_logs_for_event(ev.event_id)
                 if log_list:
                     st.markdown("**处理日志:**")

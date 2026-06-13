@@ -28,6 +28,7 @@ from core.models import (
     AnomalyEvent, AuditLog, EventStatus, ImportBatch, Priority, SkippedRowLog,
     ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
     Evidence,
+    QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
 )
 from core.persistence import (
     add_events,
@@ -67,6 +68,20 @@ from core.persistence import (
     compute_evidence_diffs,
     create_reanalysis_snapshot,
     rollback_last_reanalysis,
+    import_qc_csv,
+    save_qc_import,
+    save_qc_inspections,
+    load_qc_inspections,
+    load_qc_batches,
+    load_qc_skipped_logs,
+    load_qc_undo_records,
+    get_qc_inspections_for_event,
+    get_qc_skipped_logs_for_batch,
+    update_qc_inspection,
+    undo_last_qc_import,
+    filter_qc_inspections,
+    get_qc_summary,
+    QCVersionConflictError,
 )
 
 
@@ -3660,6 +3675,631 @@ class TestReanalysisPersistence(TestBase):
         reloaded_diffs = load_diffs()
         diffs_after = get_diffs_by_event_id(target_event_id)
         self.assertEqual(len(diffs_after), len(diffs_before))
+
+
+class TestQCInspectionImport(TestBase):
+    """Test QC inspection CSV import validation: required columns, time format, duplicate detection."""
+
+    def _import_events_first(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-qc")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-qc", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-qc", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+        return events
+
+    def test_import_valid_csv_with_event_linking(self):
+        events = self._import_events_first()
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config, operator="质检员A"
+        )
+        self.assertEqual(len(inspections), 2)
+        self.assertEqual(len(skipped), 0)
+        self.assertEqual(qc_batch.valid_count, 2)
+        self.assertEqual(qc_batch.skipped_rows, 0)
+        self.assertEqual(qc_batch.status, "成功")
+
+        bx001_insp = [i for i in inspections if i.box_id == "BX-001"][0]
+        self.assertNotEqual(bx001_insp.event_id, "")
+        self.assertEqual(bx001_insp.appearance_result, "正常")
+        self.assertEqual(bx001_insp.thermometer_reading, "-16.5")
+        self.assertEqual(bx001_insp.disposal_suggestion, "正常入库")
+        self.assertEqual(bx001_insp.operator, "质检员A")
+        self.assertEqual(bx001_insp.version, 1)
+
+        linked_evidence = [e for e in evidences if e.event_id == bx001_insp.event_id]
+        self.assertGreater(len(linked_evidence), 0)
+        self.assertEqual(linked_evidence[0].evidence_type, EvidenceType.QC_INSPECTION.value)
+
+    def test_import_missing_required_columns(self):
+        bad_csv = """箱号,抽检时间
+BX-001,2025-06-10 08:15:00
+"""
+        with self.assertRaises(ValueError) as ctx:
+            import_qc_csv(bad_csv.encode(), self.config)
+        self.assertIn("缺少必填列", str(ctx.exception))
+
+    def test_import_bad_time_format_skipped(self):
+        self._import_events_first()
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,bad-time,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        self.assertEqual(len(inspections), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("时间格式错误", skipped[0].reason)
+        self.assertEqual(skipped[0].box_id, "BX-001")
+
+    def test_import_missing_box_id_skipped(self):
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        self.assertEqual(len(inspections), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("缺箱号", skipped[0].reason)
+
+    def test_import_duplicate_box_time_skipped(self):
+        self._import_events_first()
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-001,2025-06-10 08:15:00,异常,-8.0,退货
+"""
+        inspections1, ev1, batch1, skipped1 = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        save_qc_import(inspections1, ev1, batch1, skipped1)
+
+        qc_csv2 = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,异常,-8.0,退货
+"""
+        inspections2, ev2, batch2, skipped2 = import_qc_csv(
+            qc_csv2.encode(), self.config
+        )
+        self.assertEqual(len(inspections2), 0)
+        self.assertEqual(len(skipped2), 1)
+        self.assertIn("同箱同时间重复记录", skipped2[0].reason)
+
+    def test_skipped_logs_persisted(self):
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-001,bad-time,正常,-16.5,正常入库
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+
+        saved_skipped = load_qc_skipped_logs()
+        self.assertEqual(len(saved_skipped), 2)
+        for s in saved_skipped:
+            self.assertEqual(s.qc_batch_id, qc_batch.qc_batch_id)
+            self.assertIsNotNone(s.log_id)
+
+    def test_inspection_without_matching_event(self):
+        self._import_events_first()
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-999,2025-06-10 08:15:00,正常,-16.5,正常入库
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        self.assertEqual(len(inspections), 1)
+        self.assertEqual(inspections[0].event_id, "")
+        self.assertEqual(len(evidences), 0)
+
+
+class TestQCInspectionRestartPersistence(TestBase):
+    """Test QC inspection data survives restart (simulated by reload)."""
+
+    def _import_events_and_qc(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-qc-restart")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-qc-restart", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-qc-restart", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config, operator="质检员A"
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+        return events, inspections
+
+    def test_qc_data_survives_restart(self):
+        events, inspections_before = self._import_events_and_qc()
+
+        insp_before = inspections_before[0]
+        self.assertNotEqual(insp_before.event_id, "")
+
+        reloaded_inspections = load_qc_inspections()
+        self.assertEqual(len(reloaded_inspections), 1)
+        self.assertEqual(reloaded_inspections[0].box_id, "BX-001")
+        self.assertEqual(reloaded_inspections[0].inspection_time, "2025-06-10 08:15:00")
+        self.assertEqual(reloaded_inspections[0].appearance_result, "正常")
+        self.assertEqual(reloaded_inspections[0].thermometer_reading, "-16.5")
+        self.assertEqual(reloaded_inspections[0].disposal_suggestion, "正常入库")
+        self.assertEqual(reloaded_inspections[0].operator, "质检员A")
+        self.assertEqual(reloaded_inspections[0].version, 1)
+
+        reloaded_qc_batches = load_qc_batches()
+        self.assertEqual(len(reloaded_qc_batches), 1)
+        self.assertEqual(reloaded_qc_batches[0].valid_count, 1)
+
+    def test_qc_evidence_survives_restart(self):
+        events, inspections = self._import_events_and_qc()
+        insp = inspections[0]
+
+        evidence_before = get_evidence_for_event(insp.event_id)
+        qc_evidence_before = [e for e in evidence_before if e.evidence_type == EvidenceType.QC_INSPECTION.value]
+        self.assertGreater(len(qc_evidence_before), 0)
+
+        evidence_after = get_evidence_for_event(insp.event_id)
+        qc_evidence_after = [e for e in evidence_after if e.evidence_type == EvidenceType.QC_INSPECTION.value]
+        self.assertEqual(len(qc_evidence_after), len(qc_evidence_before))
+        self.assertEqual(qc_evidence_after[0].detail, qc_evidence_before[0].detail)
+
+    def test_qc_config_survives_restart(self):
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        self.assertIn("qc_inspection", cfg)
+        self.assertIn("required_columns", cfg["qc_inspection"])
+        self.assertIn("箱号", cfg["qc_inspection"]["required_columns"])
+
+
+class TestQCVersionConflict(TestBase):
+    """Test QC inspection version conflict detection."""
+
+    def test_version_increments_on_update(self):
+        insp = QCInspection(box_id="BX-001", appearance_result="正常", thermometer_reading="-16.5")
+        save_qc_inspections([insp])
+
+        success, updated = update_qc_inspection(
+            insp.inspection_id,
+            appearance_result="异常",
+            operator="质检员A",
+        )
+        self.assertTrue(success)
+        self.assertEqual(updated.version, 2)
+        self.assertEqual(updated.appearance_result, "异常")
+
+        reloaded = load_qc_inspections()
+        self.assertEqual(reloaded[0].version, 2)
+
+    def test_version_conflict_raises_error(self):
+        insp = QCInspection(box_id="BX-001", appearance_result="正常", version=1)
+        save_qc_inspections([insp])
+
+        update_qc_inspection(insp.inspection_id, appearance_result="异常", operator="质检员A")
+
+        with self.assertRaises(QCVersionConflictError) as ctx:
+            update_qc_inspection(
+                insp.inspection_id,
+                appearance_result="退货",
+                operator="质检员B",
+                expected_version=1,
+            )
+        self.assertEqual(ctx.exception.current_version, 2)
+        self.assertEqual(ctx.exception.expected_version, 1)
+
+    def test_no_conflict_when_version_matches(self):
+        insp = QCInspection(box_id="BX-001", appearance_result="正常", version=1)
+        save_qc_inspections([insp])
+
+        success, updated = update_qc_inspection(
+            insp.inspection_id,
+            appearance_result="异常",
+            operator="质检员A",
+            expected_version=1,
+        )
+        self.assertTrue(success)
+        self.assertEqual(updated.version, 2)
+
+    def test_update_writes_audit_log(self):
+        event = AnomalyEvent(box_id="BX-001")
+        save_events([event])
+        insp = QCInspection(box_id="BX-001", event_id=event.event_id, appearance_result="正常", thermometer_reading="-16.5")
+        save_qc_inspections([insp])
+
+        update_qc_inspection(
+            insp.inspection_id,
+            appearance_result="异常",
+            operator="质检员A",
+        )
+
+        audit_logs = load_audit_logs()
+        qc_logs = [l for l in audit_logs if l.field_changed == "qc_appearance_result"]
+        self.assertGreater(len(qc_logs), 0)
+        self.assertEqual(qc_logs[0].old_value, "正常")
+        self.assertEqual(qc_logs[0].new_value, "异常")
+        self.assertEqual(qc_logs[0].operator, "质检员A")
+
+
+class TestQCUndoImport(TestBase):
+    """Test undo last QC import."""
+
+    def _import_events_and_qc(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-qc-undo")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-qc-undo", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-qc-undo", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config, operator="质检员A"
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+        return events, inspections
+
+    def test_undo_removes_inspections_and_evidence(self):
+        events, inspections = self._import_events_and_qc()
+        self.assertEqual(len(load_qc_inspections()), 2)
+
+        success, count, batch_id = undo_last_qc_import(operator="admin")
+        self.assertTrue(success)
+        self.assertEqual(count, 2)
+
+        self.assertEqual(len(load_qc_inspections()), 0)
+        self.assertEqual(len(load_qc_batches()), 0)
+
+        undo_records = load_qc_undo_records()
+        self.assertEqual(len(undo_records), 1)
+        self.assertEqual(undo_records[0].inspection_count, 2)
+        self.assertEqual(undo_records[0].operator, "admin")
+
+    def test_undo_removes_qc_evidence_from_events(self):
+        events, inspections = self._import_events_and_qc()
+        insp_with_event = [i for i in inspections if i.event_id]
+        self.assertGreater(len(insp_with_event), 0)
+        event_id = insp_with_event[0].event_id
+
+        evidence_before = get_evidence_for_event(event_id)
+        qc_evidence_before = [e for e in evidence_before if e.evidence_type == EvidenceType.QC_INSPECTION.value]
+        self.assertGreater(len(qc_evidence_before), 0)
+
+        success, count, batch_id = undo_last_qc_import(operator="admin")
+        self.assertTrue(success)
+
+        evidence_after = get_evidence_for_event(event_id)
+        qc_evidence_after = [e for e in evidence_after if e.evidence_type == EvidenceType.QC_INSPECTION.value]
+        self.assertEqual(len(qc_evidence_after), 0)
+
+    def test_undo_writes_audit_log(self):
+        events, inspections = self._import_events_and_qc()
+        insp_with_event = [i for i in inspections if i.event_id]
+        self.assertGreater(len(insp_with_event), 0)
+
+        success, count, batch_id = undo_last_qc_import(operator="admin")
+        self.assertTrue(success)
+
+        audit_logs = load_audit_logs()
+        undo_logs = [l for l in audit_logs if "撤销质检导入" in l.action]
+        self.assertGreater(len(undo_logs), 0)
+
+    def test_undo_only_removes_last_batch(self):
+        events, _ = self._import_events_and_qc()
+
+        qc_csv2 = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-002,2025-06-10 09:10:00,轻微划痕,-15.0,观察
+"""
+        inspections2, evidences2, qc_batch2, skipped2 = import_qc_csv(
+            qc_csv2.encode(), self.config, operator="质检员B"
+        )
+        save_qc_import(inspections2, evidences2, qc_batch2, skipped2)
+
+        self.assertEqual(len(load_qc_inspections()), 3)
+        self.assertEqual(len(load_qc_batches()), 2)
+
+        success, count, batch_id = undo_last_qc_import(operator="admin")
+        self.assertTrue(success)
+        self.assertEqual(count, 1)
+
+        remaining = load_qc_inspections()
+        self.assertEqual(len(remaining), 2)
+
+    def test_undo_when_no_batches(self):
+        success, count, batch_id = undo_last_qc_import(operator="admin")
+        self.assertFalse(success)
+        self.assertEqual(count, 0)
+
+    def test_undo_records_persist_across_restart(self):
+        events, _ = self._import_events_and_qc()
+        undo_last_qc_import(operator="admin")
+
+        undo_records = load_qc_undo_records()
+        self.assertEqual(len(undo_records), 1)
+
+        reloaded = load_qc_undo_records()
+        self.assertEqual(len(reloaded), 1)
+        self.assertEqual(reloaded[0].operator, "admin")
+        self.assertEqual(reloaded[0].inspection_count, 2)
+        self.assertGreater(len(reloaded[0].pre_inspections), 0)
+
+
+class TestQCFilter(TestBase):
+    """Test QC inspection filtering by batch, carrier alert, and appearance result."""
+
+    def _setup_qc_data(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-qc-filter")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-qc-filter", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        receipt_df = parse_receipt_csv(self.receipt_csv_content.encode())
+        receipt_evidence = link_receipt_evidence(events, receipt_df, "batch-qc-filter", "receipt.csv")
+        alerts = parse_carrier_alerts(self.alert_json_content.encode())
+        alert_evidence = link_alert_evidence(events, alerts, "batch-qc-filter", "alerts.json", self.config)
+        batch = ImportBatch(
+            batch_id="batch-qc-filter", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence + receipt_evidence + alert_evidence, batch, skipped_logs)
+
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config, operator="质检员A"
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+        return events, inspections
+
+    def test_filter_by_appearance_result(self):
+        events, _ = self._setup_qc_data()
+        filtered = filter_qc_inspections(appearance_result="正常")
+        self.assertGreater(len(filtered), 0)
+        for i in filtered:
+            self.assertEqual(i.appearance_result, "正常")
+
+        filtered2 = filter_qc_inspections(appearance_result="包装破损")
+        self.assertGreater(len(filtered2), 0)
+        for i in filtered2:
+            self.assertEqual(i.appearance_result, "包装破损")
+
+    def test_filter_by_carrier_alert(self):
+        events, _ = self._setup_qc_data()
+        with_alert = filter_qc_inspections(has_carrier_alert=True)
+        for i in with_alert:
+            ev = get_event_by_id(i.event_id)
+            if ev:
+                self.assertGreater(ev.carrier_alert_count, 0)
+
+        without_alert = filter_qc_inspections(has_carrier_alert=False)
+        for i in without_alert:
+            ev = get_event_by_id(i.event_id)
+            if ev:
+                self.assertEqual(ev.carrier_alert_count, 0)
+
+    def test_filter_by_batch(self):
+        events, inspections = self._setup_qc_data()
+        qc_batch_id = inspections[0].qc_batch_id
+        filtered = filter_qc_inspections(batch_id=qc_batch_id)
+        self.assertEqual(len(filtered), len(inspections))
+        for i in filtered:
+            self.assertEqual(i.qc_batch_id, qc_batch_id)
+
+    def test_filter_combined(self):
+        events, _ = self._setup_qc_data()
+        filtered = filter_qc_inspections(
+            has_carrier_alert=True,
+            appearance_result="正常",
+        )
+        for i in filtered:
+            self.assertEqual(i.appearance_result, "正常")
+            ev = get_event_by_id(i.event_id)
+            if ev:
+                self.assertGreater(ev.carrier_alert_count, 0)
+
+    def test_get_qc_summary(self):
+        events, _ = self._setup_qc_data()
+        summary = get_qc_summary()
+        self.assertGreater(summary["total_inspections"], 0)
+        self.assertGreater(summary["linked_to_events"], 0)
+        self.assertGreaterEqual(summary["unlinked"], 0)
+        self.assertIn("appearance_result_counts", summary)
+        self.assertGreater(summary["total_batches"], 0)
+
+
+class TestQCExportFields(TestBase):
+    """Test CSV and JSON exports include QC inspection data."""
+
+    def _setup_events_with_qc(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-qc-export")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-qc-export", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-qc-export", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+BX-001,2025-06-10 08:15:00,正常,-16.5,正常入库
+BX-004,2025-06-10 11:10:00,包装破损,-8.0,退货处理
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config, operator="质检员A"
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+        return events
+
+    def test_csv_export_includes_qc_rows(self):
+        self._setup_events_with_qc()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        qc_rows = df[df["row_type"] == "质检抽检"]
+        self.assertGreater(len(qc_rows), 0)
+
+        required_cols = ["inspection_id", "qc_batch_id", "inspection_time",
+                         "appearance_result", "thermometer_reading",
+                         "disposal_suggestion", "qc_operator", "qc_version"]
+        for col in required_cols:
+            self.assertIn(col, df.columns, f"CSV missing QC column: {col}")
+
+    def test_csv_export_includes_qc_summary(self):
+        self._setup_events_with_qc()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        summary_rows = df[df["row_type"] == "质检摘要"]
+        self.assertGreater(len(summary_rows), 0)
+
+    def test_csv_export_includes_qc_skipped_rows(self):
+        qc_csv = """箱号,抽检时间,外观结果,温度计读数,处置建议
+,2025-06-10 08:15:00,正常,-16.5,正常入库
+"""
+        inspections, evidences, qc_batch, skipped = import_qc_csv(
+            qc_csv.encode(), self.config
+        )
+        save_qc_import(inspections, evidences, qc_batch, skipped)
+
+        from app import build_csv_export
+        events = load_events()
+        if events:
+            csv_content = build_csv_export(events)
+            df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+            skipped_rows = df[df["row_type"] == "质检跳过行"]
+            self.assertGreater(len(skipped_rows), 0)
+
+    def test_csv_export_includes_qc_undo_records(self):
+        self._setup_events_with_qc()
+        undo_last_qc_import(operator="admin")
+
+        from app import build_csv_export
+        events = load_events()
+        if events:
+            csv_content = build_csv_export(events)
+            df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+            undo_rows = df[df["row_type"] == "质检撤销记录"]
+            self.assertGreater(len(undo_rows), 0)
+
+    def test_csv_event_row_has_qc_fields(self):
+        self._setup_events_with_qc()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        event_rows = df[df["row_type"] == "事件"]
+        self.assertIn("qc_inspection_count", event_rows.columns)
+        with_qc = event_rows[event_rows["qc_inspection_count"].astype(float).astype(int) > 0]
+        self.assertGreater(len(with_qc), 0)
+
+    def test_json_export_includes_qc_fields(self):
+        self._setup_events_with_qc()
+        from app import build_json_export
+
+        payload = build_json_export(load_events())
+
+        self.assertIn("qc_summary", payload)
+        self.assertIn("qc_inspections", payload)
+        self.assertIn("qc_skipped_rows", payload)
+        self.assertIn("qc_undo_records", payload)
+        self.assertIn("qc_import_batches", payload)
+
+        self.assertGreater(len(payload["qc_inspections"]), 0)
+        self.assertGreater(payload["qc_summary"]["total_inspections"], 0)
+
+        for ev in payload["events"]:
+            self.assertIn("qc_inspection_count", ev)
+            self.assertIn("qc_inspections", ev)
+
+        event_with_qc = [ev for ev in payload["events"] if ev["qc_inspection_count"] > 0]
+        self.assertGreater(len(event_with_qc), 0)
+        for ev in event_with_qc:
+            self.assertGreater(len(ev["qc_inspections"]), 0)
+            qi = ev["qc_inspections"][0]
+            self.assertIn("inspection_id", qi)
+            self.assertIn("box_id", qi)
+            self.assertIn("appearance_result", qi)
+            self.assertIn("thermometer_reading", qi)
+            self.assertIn("disposal_suggestion", qi)
+
+    def test_json_and_csv_qc_consistent(self):
+        self._setup_events_with_qc()
+        from app import build_csv_export, build_json_export
+
+        filtered = load_events()
+        csv_content = build_csv_export(filtered)
+        json_payload = build_json_export(filtered)
+
+        csv_df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        csv_qc_rows = csv_df[csv_df["row_type"] == "质检抽检"]
+        json_qc = json_payload["qc_inspections"]
+
+        self.assertEqual(len(csv_qc_rows), len(json_qc))
+
+        csv_event = csv_df[csv_df["row_type"] == "事件"]
+        for _, row in csv_event.iterrows():
+            if int(float(row.get("qc_inspection_count", 0))) > 0:
+                event_id = row["event_id"]
+                json_ev = next(e for e in json_payload["events"] if e["event_id"] == event_id)
+                self.assertEqual(int(float(row["qc_inspection_count"])), json_ev["qc_inspection_count"])
 
 
 if __name__ == "__main__":

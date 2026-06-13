@@ -21,3 +21,13 @@ assignment:
     - 中班B
     - 晚班A
     - 晚班B
+qc_inspection:
+  required_columns:
+    - 箱号
+    - 抽检时间
+    - 外观结果
+    - 温度计读数
+    - 处置建议
+  time_column: 抽检时间
+  time_format: "%Y-%m-%d %H:%M:%S"
+  match_window_minutes: 60

@@ -1,13 +1,17 @@
 import json
+import hashlib
 import os
 import threading
 from dataclasses import fields as dataclass_fields
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
+
+import pandas as pd
 
 from .models import (
     AnomalyEvent, AuditLog, Evidence, ImportBatch, Priority, SkippedRowLog,
     ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
+    QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
 )
 
 _BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "store")
@@ -18,6 +22,10 @@ _BATCHES_FILE = os.path.join(_BASE_DIR, "batches.json")
 _SKIPPED_FILE = os.path.join(_BASE_DIR, "skipped_rows.json")
 _SNAPSHOTS_FILE = os.path.join(_BASE_DIR, "reanalysis_snapshots.json")
 _DIFFS_FILE = os.path.join(_BASE_DIR, "event_diffs.json")
+_QC_INSPECTIONS_FILE = os.path.join(_BASE_DIR, "qc_inspections.json")
+_QC_BATCHES_FILE = os.path.join(_BASE_DIR, "qc_import_batches.json")
+_QC_SKIPPED_FILE = os.path.join(_BASE_DIR, "qc_skipped_rows.json")
+_QC_UNDO_FILE = os.path.join(_BASE_DIR, "qc_undo_records.json")
 
 _lock = threading.Lock()
 
@@ -1071,12 +1079,440 @@ def get_diffs_by_change_type(
     return diffs
 
 
+def _qc_parse_ts(ts_str: str):
+    try:
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def load_qc_inspections() -> list[QCInspection]:
+    data = _read_json(_QC_INSPECTIONS_FILE)
+    return [QCInspection(**d) for d in data]
+
+
+def save_qc_inspections(inspections: list[QCInspection]):
+    _write_json(_QC_INSPECTIONS_FILE, [i.to_dict() for i in inspections])
+
+
+def load_qc_batches() -> list[QCImportBatch]:
+    data = _read_json(_QC_BATCHES_FILE)
+    return [QCImportBatch(**d) for d in data]
+
+
+def save_qc_batches(batches: list[QCImportBatch]):
+    _write_json(_QC_BATCHES_FILE, [b.to_dict() for b in batches])
+
+
+def load_qc_skipped_logs() -> list[QCSkippedRowLog]:
+    data = _read_json(_QC_SKIPPED_FILE)
+    return [QCSkippedRowLog(**d) for d in data]
+
+
+def save_qc_skipped_logs(logs: list[QCSkippedRowLog]):
+    _write_json(_QC_SKIPPED_FILE, [l.to_dict() for l in logs])
+
+
+def load_qc_undo_records() -> list[QCUndoRecord]:
+    data = _read_json(_QC_UNDO_FILE)
+    return [QCUndoRecord(**d) for d in data]
+
+
+def save_qc_undo_records(records: list[QCUndoRecord]):
+    _write_json(_QC_UNDO_FILE, [r.to_dict() for r in records])
+
+
+def _match_inspection_to_event(box_id: str, inspection_time: str, events: list[AnomalyEvent], window_minutes: int = 60) -> Optional[AnomalyEvent]:
+    insp_dt = _qc_parse_ts(inspection_time)
+    if not insp_dt:
+        return None
+    best_event = None
+    best_diff = None
+    for ev in events:
+        if ev.box_id != box_id:
+            continue
+        ev_start = _qc_parse_ts(ev.start_time)
+        ev_end = _qc_parse_ts(ev.end_time)
+        if not ev_start or not ev_end:
+            continue
+        window_start = ev_start - timedelta(minutes=window_minutes)
+        window_end = ev_end + timedelta(minutes=window_minutes)
+        if window_start <= insp_dt <= window_end:
+            diff = abs((insp_dt - ev_start).total_seconds())
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_event = ev
+    return best_event
+
+
+def import_qc_csv(
+    content: bytes,
+    config: dict,
+    operator: str = "",
+) -> Tuple[list[QCInspection], list[Evidence], QCImportBatch, list[QCSkippedRowLog]]:
+    qc_config = config.get("qc_inspection", {})
+    required_columns = qc_config.get("required_columns", ["箱号", "抽检时间", "外观结果", "温度计读数", "处置建议"])
+    time_column = qc_config.get("time_column", "抽检时间")
+    time_format = qc_config.get("time_format", "%Y-%m-%d %H:%M:%S")
+    match_window = int(qc_config.get("match_window_minutes", 60))
+
+    column_mapping = {
+        "箱号": "box_id",
+        "抽检时间": "inspection_time",
+        "外观结果": "appearance_result",
+        "温度计读数": "thermometer_reading",
+        "处置建议": "disposal_suggestion",
+    }
+
+    df = pd.read_csv(pd.io.common.BytesIO(content), dtype=str)
+    df.columns = df.columns.str.strip()
+
+    missing_cols = set(required_columns) - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"质检 CSV 缺少必填列: {missing_cols}")
+
+    qc_batch = QCImportBatch(
+        file_hash=hashlib.sha256(content).hexdigest(),
+        row_count=len(df),
+    )
+    inspections: list[QCInspection] = []
+    skipped_logs: list[QCSkippedRowLog] = []
+    evidences: list[Evidence] = []
+    existing_inspections = load_qc_inspections()
+    existing_keys = {(i.box_id, i.inspection_time) for i in existing_inspections}
+    events = load_events()
+
+    for idx, row in df.iterrows():
+        row_number = int(idx) + 2
+        raw_values = {}
+        for cn_col, model_field in column_mapping.items():
+            raw_values[model_field] = str(row.get(cn_col, "")).strip() if cn_col in df.columns else ""
+
+        box_id = raw_values["box_id"]
+        insp_time_raw = raw_values["inspection_time"]
+        appearance = raw_values["appearance_result"]
+        thermo = raw_values["thermometer_reading"]
+        disposal = raw_values["disposal_suggestion"]
+
+        skip_reason = ""
+        if not box_id or box_id == "nan":
+            skip_reason = "缺箱号"
+        elif not insp_time_raw or insp_time_raw == "nan":
+            skip_reason = "缺抽检时间"
+        else:
+            try:
+                datetime.strptime(insp_time_raw, time_format)
+            except (ValueError, TypeError):
+                skip_reason = f"时间格式错误: {insp_time_raw}，期望: {time_format}"
+
+        if not skip_reason and (box_id, insp_time_raw) in existing_keys:
+            skip_reason = f"同箱同时间重复记录: 箱号={box_id}, 时间={insp_time_raw}"
+
+        if skip_reason:
+            skipped_logs.append(QCSkippedRowLog(
+                qc_batch_id=qc_batch.qc_batch_id,
+                row_number=row_number,
+                reason=skip_reason,
+                box_id=box_id if box_id != "nan" else "",
+                inspection_time_raw=insp_time_raw if insp_time_raw != "nan" else "",
+                appearance_result_raw=appearance if appearance != "nan" else "",
+                thermometer_reading_raw=thermo if thermo != "nan" else "",
+                disposal_suggestion_raw=disposal if disposal != "nan" else "",
+            ))
+            continue
+
+        insp = QCInspection(
+            box_id=box_id,
+            inspection_time=insp_time_raw,
+            appearance_result=appearance if appearance != "nan" else "",
+            thermometer_reading=thermo if thermo != "nan" else "",
+            disposal_suggestion=disposal if disposal != "nan" else "",
+            qc_batch_id=qc_batch.qc_batch_id,
+            operator=operator,
+        )
+
+        matched_event = _match_inspection_to_event(box_id, insp_time_raw, events, match_window)
+        if matched_event:
+            insp.event_id = matched_event.event_id
+            ev = Evidence(
+                event_id=matched_event.event_id,
+                evidence_type=EvidenceType.QC_INSPECTION.value,
+                source_file=f"qc_batch_{qc_batch.qc_batch_id}",
+                box_id=box_id,
+                timestamp=insp_time_raw,
+                detail=f"外观: {appearance}, 温度计: {thermo}, 处置: {disposal}",
+            )
+            evidences.append(ev)
+            matched_event.evidence_ids.append(ev.evidence_id)
+            _append_audit_log(
+                load_audit_logs(),
+                matched_event.event_id,
+                action="关联质检抽检",
+                operator=operator or "system",
+                remark=f"箱号 {box_id} 抽检时间 {insp_time_raw}",
+                field_changed="qc_inspection",
+                old_value="",
+                new_value=insp.inspection_id,
+            )
+
+        inspections.append(insp)
+        existing_keys.add((box_id, insp_time_raw))
+
+    qc_batch.valid_count = len(inspections)
+    qc_batch.skipped_rows = len(skipped_logs)
+    qc_batch.status = "成功" if inspections else "无有效数据"
+
+    return inspections, evidences, qc_batch, skipped_logs
+
+
+def save_qc_import(
+    inspections: list[QCInspection],
+    evidences: list[Evidence],
+    qc_batch: QCImportBatch,
+    skipped_logs: list[QCSkippedRowLog],
+):
+    with _lock:
+        existing_inspections = load_qc_inspections()
+        existing_evidence = load_evidence()
+        existing_qc_batches = load_qc_batches()
+        existing_qc_skipped = load_qc_skipped_logs()
+        existing_events = load_events()
+
+        existing_inspections.extend(inspections)
+        existing_evidence.extend(evidences)
+        existing_qc_batches.append(qc_batch)
+        existing_qc_skipped.extend(skipped_logs)
+
+        event_by_id = {e.event_id: e for e in existing_events}
+        for ev_obj in evidences:
+            if ev_obj.event_id in event_by_id:
+                event = event_by_id[ev_obj.event_id]
+                if ev_obj.evidence_id not in event.evidence_ids:
+                    event.evidence_ids.append(ev_obj.evidence_id)
+
+        save_qc_inspections(existing_inspections)
+        save_evidence(existing_evidence)
+        save_qc_batches(existing_qc_batches)
+        save_qc_skipped_logs(existing_qc_skipped)
+        save_events(existing_events)
+
+
+def get_qc_inspections_for_event(event_id: str) -> list[QCInspection]:
+    all_inspections = load_qc_inspections()
+    return [i for i in all_inspections if i.event_id == event_id]
+
+
+def get_qc_skipped_logs_for_batch(qc_batch_id: str) -> list[QCSkippedRowLog]:
+    all_logs = load_qc_skipped_logs()
+    return [l for l in all_logs if l.qc_batch_id == qc_batch_id]
+
+
+class QCVersionConflictError(Exception):
+    def __init__(self, inspection_id: str, current_version: int, expected_version: int):
+        self.inspection_id = inspection_id
+        self.current_version = current_version
+        self.expected_version = expected_version
+        super().__init__(
+            f"质检记录 {inspection_id} 已被更新（当前版本: {current_version}, 期望版本: {expected_version}）"
+        )
+
+
+def update_qc_inspection(
+    inspection_id: str,
+    appearance_result: str = None,
+    thermometer_reading: str = None,
+    disposal_suggestion: str = None,
+    operator: str = "",
+    expected_version: int = None,
+) -> Tuple[bool, Optional[QCInspection]]:
+    with _lock:
+        inspections = load_qc_inspections()
+        audit_logs = load_audit_logs()
+        target = None
+        for insp in inspections:
+            if insp.inspection_id == inspection_id:
+                target = insp
+                break
+
+        if not target:
+            return False, None
+
+        if expected_version is not None and target.version != expected_version:
+            raise QCVersionConflictError(inspection_id, target.version, expected_version)
+
+        old_appearance = target.appearance_result
+        old_thermo = target.thermometer_reading
+        old_disposal = target.disposal_suggestion
+
+        if appearance_result is not None:
+            target.appearance_result = appearance_result
+        if thermometer_reading is not None:
+            target.thermometer_reading = thermometer_reading
+        if disposal_suggestion is not None:
+            target.disposal_suggestion = disposal_suggestion
+
+        target.version += 1
+        target.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if old_appearance != target.appearance_result:
+            _append_audit_log(
+                audit_logs, target.event_id or inspection_id,
+                action=f"质检外观结果变更: {old_appearance} -> {target.appearance_result}",
+                operator=operator,
+                field_changed="qc_appearance_result",
+                old_value=old_appearance,
+                new_value=target.appearance_result,
+            )
+        if old_thermo != target.thermometer_reading:
+            _append_audit_log(
+                audit_logs, target.event_id or inspection_id,
+                action=f"质检温度计读数变更: {old_thermo} -> {target.thermometer_reading}",
+                operator=operator,
+                field_changed="qc_thermometer_reading",
+                old_value=old_thermo,
+                new_value=target.thermometer_reading,
+            )
+        if old_disposal != target.disposal_suggestion:
+            _append_audit_log(
+                audit_logs, target.event_id or inspection_id,
+                action=f"质检处置建议变更: {old_disposal} -> {target.disposal_suggestion}",
+                operator=operator,
+                field_changed="qc_disposal_suggestion",
+                old_value=old_disposal,
+                new_value=target.disposal_suggestion,
+            )
+
+        save_qc_inspections(inspections)
+        save_audit_logs(audit_logs)
+        return True, target
+
+
+def undo_last_qc_import(operator: str = "system") -> Tuple[bool, int, str]:
+    with _lock:
+        qc_batches = load_qc_batches()
+        if not qc_batches:
+            return False, 0, ""
+
+        last_batch = qc_batches[-1]
+
+        inspections = load_qc_inspections()
+        to_remove = [i for i in inspections if i.qc_batch_id == last_batch.qc_batch_id]
+        pre_inspections = [i.to_dict() for i in to_remove]
+        remaining_inspections = [i for i in inspections if i.qc_batch_id != last_batch.qc_batch_id]
+
+        evidence_ids_to_remove = set()
+        for insp in to_remove:
+            if insp.event_id:
+                ev = get_event_by_id(insp.event_id)
+                if ev:
+                    related_evidence = [
+                        e for e in load_evidence()
+                        if e.event_id == insp.event_id
+                        and e.evidence_type == EvidenceType.QC_INSPECTION.value
+                        and e.box_id == insp.box_id
+                        and e.timestamp == insp.inspection_time
+                    ]
+                    evidence_ids_to_remove.update(e.evidence_id for e in related_evidence)
+
+        existing_evidence = load_evidence()
+        remaining_evidence = [e for e in existing_evidence if e.evidence_id not in evidence_ids_to_remove]
+
+        existing_events = load_events()
+        for ev in existing_events:
+            ev.evidence_ids = [eid for eid in ev.evidence_ids if eid not in evidence_ids_to_remove]
+
+        audit_logs = load_audit_logs()
+        for insp in to_remove:
+            if insp.event_id:
+                _append_audit_log(
+                    audit_logs, insp.event_id,
+                    action="撤销质检导入",
+                    operator=operator,
+                    remark=f"撤销批次 {last_batch.qc_batch_id} 的质检记录，箱号 {insp.box_id}",
+                    field_changed="qc_inspection",
+                    old_value=insp.inspection_id,
+                    new_value="",
+                )
+
+        undo_record = QCUndoRecord(
+            qc_batch_id=last_batch.qc_batch_id,
+            operator=operator,
+            inspection_count=len(to_remove),
+            pre_inspections=pre_inspections,
+        )
+
+        existing_undo = load_qc_undo_records()
+        existing_undo.append(undo_record)
+
+        qc_batches = qc_batches[:-1]
+        existing_qc_skipped = load_qc_skipped_logs()
+        remaining_skipped = [l for l in existing_qc_skipped if l.qc_batch_id != last_batch.qc_batch_id]
+
+        save_qc_inspections(remaining_inspections)
+        save_evidence(remaining_evidence)
+        save_events(existing_events)
+        save_audit_logs(audit_logs)
+        save_qc_batches(qc_batches)
+        save_qc_skipped_logs(remaining_skipped)
+        save_qc_undo_records(existing_undo)
+
+        return True, len(to_remove), last_batch.qc_batch_id
+
+
+def filter_qc_inspections(
+    batch_id: str = "",
+    has_carrier_alert: Optional[bool] = None,
+    appearance_result: str = "",
+) -> list[QCInspection]:
+    inspections = load_qc_inspections()
+    if batch_id:
+        inspections = [i for i in inspections if i.qc_batch_id == batch_id]
+    if has_carrier_alert is not None:
+        events = load_events()
+        event_map = {e.event_id: e for e in events}
+        filtered = []
+        for insp in inspections:
+            ev = event_map.get(insp.event_id)
+            if ev:
+                if has_carrier_alert and ev.carrier_alert_count > 0:
+                    filtered.append(insp)
+                elif not has_carrier_alert and ev.carrier_alert_count == 0:
+                    filtered.append(insp)
+        inspections = filtered
+    if appearance_result:
+        inspections = [i for i in inspections if i.appearance_result == appearance_result]
+    return inspections
+
+
+def get_qc_summary() -> Dict[str, Any]:
+    inspections = load_qc_inspections()
+    events = load_events()
+    event_map = {e.event_id: e for e in events}
+    linked = sum(1 for i in inspections if i.event_id and i.event_id in event_map)
+    appearance_counts: Dict[str, int] = {}
+    for i in inspections:
+        appearance_counts[i.appearance_result] = appearance_counts.get(i.appearance_result, 0) + 1
+    batches = load_qc_batches()
+    skipped = load_qc_skipped_logs()
+    undo_records = load_qc_undo_records()
+    return {
+        "total_inspections": len(inspections),
+        "linked_to_events": linked,
+        "unlinked": len(inspections) - linked,
+        "appearance_result_counts": appearance_counts,
+        "total_batches": len(batches),
+        "total_skipped_rows": len(skipped),
+        "total_undo_records": len(undo_records),
+    }
+
+
 def clear_all_for_test():
     """Only for testing purposes."""
     with _lock:
         for path in [
             _EVENTS_FILE, _EVIDENCE_FILE, _AUDIT_FILE, _BATCHES_FILE,
-            _SKIPPED_FILE, _SNAPSHOTS_FILE, _DIFFS_FILE
+            _SKIPPED_FILE, _SNAPSHOTS_FILE, _DIFFS_FILE,
+            _QC_INSPECTIONS_FILE, _QC_BATCHES_FILE, _QC_SKIPPED_FILE, _QC_UNDO_FILE
         ]:
             if os.path.exists(path):
                 os.remove(path)
