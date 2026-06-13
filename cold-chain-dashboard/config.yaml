@@ -44,3 +44,29 @@ handover_check:
   temperature_lower_limit: -40.0
   temperature_upper_limit: 10.0
   match_window_minutes: 120
+damage_claim:
+  required_columns:
+    - 箱号
+    - 登记时间
+    - 破损类型
+    - 破损等级
+    - 照片编号
+    - 登记人
+    - 备注
+  time_column: 登记时间
+  time_format: "%Y-%m-%d %H:%M:%S"
+  damage_levels:
+    - 轻微
+    - 中度
+    - 严重
+    - 拒收
+  acceptable_damage_types:
+    - 外包装破损
+    - 内包装破损
+    - 封条破损
+    - 箱体变形
+    - 标签缺失
+    - 渗漏
+    - 虫害
+    - 其他
+  match_window_minutes: 180

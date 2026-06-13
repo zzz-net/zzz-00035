@@ -13,6 +13,7 @@ from .models import (
     ReanalysisSnapshot, EventDiffRecord, FieldDiff, EvidenceDiff, ChangeType,
     QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
     HandoverRecord, HandoverImportBatch, HandoverSkippedRowLog, HandoverUndoRecord,
+    DamageClaimRecord, DamageClaimImportBatch, DamageClaimSkippedRowLog, DamageClaimUndoRecord,
 )
 
 _BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "store")
@@ -31,6 +32,10 @@ _HANDOVER_FILE = os.path.join(_BASE_DIR, "handover_records.json")
 _HANDOVER_BATCHES_FILE = os.path.join(_BASE_DIR, "handover_import_batches.json")
 _HANDOVER_SKIPPED_FILE = os.path.join(_BASE_DIR, "handover_skipped_rows.json")
 _HANDOVER_UNDO_FILE = os.path.join(_BASE_DIR, "handover_undo_records.json")
+_DAMAGE_CLAIM_FILE = os.path.join(_BASE_DIR, "damage_claim_records.json")
+_DAMAGE_CLAIM_BATCHES_FILE = os.path.join(_BASE_DIR, "damage_claim_import_batches.json")
+_DAMAGE_CLAIM_SKIPPED_FILE = os.path.join(_BASE_DIR, "damage_claim_skipped_rows.json")
+_DAMAGE_CLAIM_UNDO_FILE = os.path.join(_BASE_DIR, "damage_claim_undo_records.json")
 
 _lock = threading.Lock()
 
@@ -1893,6 +1898,443 @@ def get_handover_summary() -> Dict[str, Any]:
     }
 
 
+def load_damage_claim_records() -> list[DamageClaimRecord]:
+    data = _read_json(_DAMAGE_CLAIM_FILE)
+    return [DamageClaimRecord(**d) for d in data]
+
+
+def save_damage_claim_records(records: list[DamageClaimRecord]):
+    _write_json(_DAMAGE_CLAIM_FILE, [r.to_dict() for r in records])
+
+
+def load_damage_claim_batches() -> list[DamageClaimImportBatch]:
+    data = _read_json(_DAMAGE_CLAIM_BATCHES_FILE)
+    return [DamageClaimImportBatch(**d) for d in data]
+
+
+def save_damage_claim_batches(batches: list[DamageClaimImportBatch]):
+    _write_json(_DAMAGE_CLAIM_BATCHES_FILE, [b.to_dict() for b in batches])
+
+
+def load_damage_claim_skipped_logs() -> list[DamageClaimSkippedRowLog]:
+    data = _read_json(_DAMAGE_CLAIM_SKIPPED_FILE)
+    return [DamageClaimSkippedRowLog(**d) for d in data]
+
+
+def save_damage_claim_skipped_logs(logs: list[DamageClaimSkippedRowLog]):
+    _write_json(_DAMAGE_CLAIM_SKIPPED_FILE, [l.to_dict() for l in logs])
+
+
+def load_damage_claim_undo_records() -> list[DamageClaimUndoRecord]:
+    data = _read_json(_DAMAGE_CLAIM_UNDO_FILE)
+    return [DamageClaimUndoRecord(**d) for d in data]
+
+
+def save_damage_claim_undo_records(records: list[DamageClaimUndoRecord]):
+    _write_json(_DAMAGE_CLAIM_UNDO_FILE, [r.to_dict() for r in records])
+
+
+def _damage_claim_parse_ts(ts_str: str, time_format: str):
+    try:
+        return datetime.strptime(ts_str, time_format)
+    except (ValueError, TypeError):
+        return None
+
+
+def _match_damage_claim_to_event(
+    box_id: str,
+    registration_time: str,
+    events: list[AnomalyEvent],
+    time_format: str,
+    window_minutes: int = 180,
+) -> Optional[AnomalyEvent]:
+    reg_dt = _damage_claim_parse_ts(registration_time, time_format)
+    if not reg_dt:
+        return None
+    best_event = None
+    best_diff = None
+    for ev in events:
+        if ev.box_id != box_id:
+            continue
+        ev_start = _damage_claim_parse_ts(ev.start_time, "%Y-%m-%d %H:%M:%S")
+        ev_end = _damage_claim_parse_ts(ev.end_time, "%Y-%m-%d %H:%M:%S")
+        if not ev_start or not ev_end:
+            continue
+        ev_start = ev_start or datetime.strptime(ev.start_time, "%Y-%m-%d %H:%M:%S")
+        ev_end = ev_end or datetime.strptime(ev.end_time, "%Y-%m-%d %H:%M:%S")
+        window_start = ev_start - timedelta(minutes=window_minutes)
+        window_end = ev_end + timedelta(minutes=window_minutes)
+        if window_start <= reg_dt <= window_end:
+            diff = abs((reg_dt - ev_start).total_seconds())
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_event = ev
+    return best_event
+
+
+def import_damage_claim_csv(
+    content: bytes,
+    config: dict,
+    operator: str = "",
+) -> Tuple[list[DamageClaimRecord], list[Evidence], DamageClaimImportBatch, list[DamageClaimSkippedRowLog]]:
+    dc_config = config.get("damage_claim", {})
+    required_columns = dc_config.get("required_columns", [
+        "箱号", "登记时间", "破损类型", "破损等级", "照片编号", "登记人", "备注"
+    ])
+    time_column = dc_config.get("time_column", "登记时间")
+    time_format = dc_config.get("time_format", "%Y-%m-%d %H:%M:%S")
+    damage_levels = dc_config.get("damage_levels", ["轻微", "中度", "严重", "拒收"])
+    acceptable_damage_types = dc_config.get("acceptable_damage_types", [
+        "外包装破损", "内包装破损", "封条破损", "箱体变形", "标签缺失", "渗漏", "虫害", "其他"
+    ])
+    match_window = int(dc_config.get("match_window_minutes", 180))
+
+    column_mapping = {
+        "箱号": "box_id",
+        "登记时间": "registration_time",
+        "破损类型": "damage_type",
+        "破损等级": "damage_level",
+        "照片编号": "photo_number",
+        "登记人": "registrar",
+        "备注": "remark",
+    }
+
+    df = pd.read_csv(pd.io.common.BytesIO(content), dtype=str)
+    df.columns = df.columns.str.strip()
+
+    missing_cols = set(required_columns) - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"破损 CSV 缺少必填列: {missing_cols}")
+
+    dc_batch = DamageClaimImportBatch(
+        file_hash=hashlib.sha256(content).hexdigest(),
+        row_count=len(df),
+    )
+    records: list[DamageClaimRecord] = []
+    skipped_logs: list[DamageClaimSkippedRowLog] = []
+    evidences: list[Evidence] = []
+    existing_records = load_damage_claim_records()
+    existing_keys = {(r.box_id, r.photo_number) for r in existing_records}
+    events = load_events()
+    existing_audit = load_audit_logs()
+
+    for idx, row in df.iterrows():
+        row_number = int(idx) + 2
+        raw_values = {}
+        for cn_col, model_field in column_mapping.items():
+            raw_values[model_field] = str(row.get(cn_col, "")).strip() if cn_col in df.columns else ""
+
+        box_id = raw_values["box_id"]
+        reg_time_raw = raw_values["registration_time"]
+        damage_type_raw = raw_values["damage_type"]
+        damage_level_raw = raw_values["damage_level"]
+        photo_number_raw = raw_values["photo_number"]
+        registrar_raw = raw_values["registrar"]
+        remark_raw = raw_values["remark"]
+
+        skip_reason = ""
+        if not box_id or box_id == "nan":
+            skip_reason = "缺箱号"
+        elif not reg_time_raw or reg_time_raw == "nan":
+            skip_reason = "缺登记时间"
+        elif not damage_type_raw or damage_type_raw == "nan":
+            skip_reason = "缺破损类型"
+        elif not damage_level_raw or damage_level_raw == "nan":
+            skip_reason = "缺破损等级"
+        elif not photo_number_raw or photo_number_raw == "nan":
+            skip_reason = "缺照片编号"
+        elif not registrar_raw or registrar_raw == "nan":
+            skip_reason = "缺登记人"
+        else:
+            try:
+                datetime.strptime(reg_time_raw, time_format)
+            except (ValueError, TypeError):
+                skip_reason = f"时间格式错误: {reg_time_raw}，期望: {time_format}"
+
+        if not skip_reason and damage_level_raw not in damage_levels:
+            skip_reason = f"破损等级无效: {damage_level_raw}，允许值: {damage_levels}"
+
+        if not skip_reason and damage_type_raw not in acceptable_damage_types:
+            skip_reason = f"破损类型不受理: {damage_type_raw}，允许类型: {acceptable_damage_types}"
+
+        if not skip_reason and (box_id, photo_number_raw) in existing_keys:
+            skip_reason = f"同箱同照片编号重复记录: 箱号={box_id}, 照片编号={photo_number_raw}"
+
+        if skip_reason:
+            skipped_logs.append(DamageClaimSkippedRowLog(
+                damage_claim_batch_id=dc_batch.damage_claim_batch_id,
+                row_number=row_number,
+                reason=skip_reason,
+                box_id=box_id if box_id != "nan" else "",
+                registration_time_raw=reg_time_raw if reg_time_raw != "nan" else "",
+                damage_type_raw=damage_type_raw if damage_type_raw != "nan" else "",
+                damage_level_raw=damage_level_raw if damage_level_raw != "nan" else "",
+                photo_number_raw=photo_number_raw if photo_number_raw != "nan" else "",
+                registrar_raw=registrar_raw if registrar_raw != "nan" else "",
+                remark_raw=remark_raw if remark_raw != "nan" else "",
+            ))
+            continue
+
+        record = DamageClaimRecord(
+            box_id=box_id,
+            registration_time=reg_time_raw,
+            damage_type=damage_type_raw,
+            damage_level=damage_level_raw,
+            photo_number=photo_number_raw,
+            registrar=registrar_raw,
+            remark=remark_raw if remark_raw != "nan" else "",
+            damage_claim_batch_id=dc_batch.damage_claim_batch_id,
+            operator=operator,
+        )
+
+        matched_event = _match_damage_claim_to_event(box_id, reg_time_raw, events, time_format, match_window)
+        if matched_event:
+            record.event_id = matched_event.event_id
+            ev = Evidence(
+                event_id=matched_event.event_id,
+                evidence_type=EvidenceType.DAMAGE_CLAIM.value,
+                source_file=f"damage_claim_batch_{dc_batch.damage_claim_batch_id}",
+                box_id=box_id,
+                timestamp=reg_time_raw,
+                detail=f"破损类型: {damage_type_raw}, 等级: {damage_level_raw}, 照片编号: {photo_number_raw}, 登记人: {registrar_raw}",
+            )
+            evidences.append(ev)
+            matched_event.evidence_ids.append(ev.evidence_id)
+            _append_audit_log(
+                existing_audit,
+                matched_event.event_id,
+                action="关联包装破损",
+                operator=operator or "system",
+                remark=f"箱号 {box_id} 登记时间 {reg_time_raw}",
+                field_changed="damage_claim",
+                old_value="",
+                new_value=record.damage_claim_id,
+            )
+
+        records.append(record)
+        existing_keys.add((box_id, photo_number_raw))
+
+    dc_batch.valid_count = len(records)
+    dc_batch.skipped_rows = len(skipped_logs)
+    dc_batch.status = "成功" if records else "无有效数据"
+
+    save_audit_logs(existing_audit)
+
+    return records, evidences, dc_batch, skipped_logs
+
+
+def save_damage_claim_import(
+    records: list[DamageClaimRecord],
+    evidences: list[Evidence],
+    dc_batch: DamageClaimImportBatch,
+    skipped_logs: list[DamageClaimSkippedRowLog],
+):
+    with _lock:
+        existing_records = load_damage_claim_records()
+        existing_evidence = load_evidence()
+        existing_dc_batches = load_damage_claim_batches()
+        existing_dc_skipped = load_damage_claim_skipped_logs()
+        existing_events = load_events()
+
+        existing_records.extend(records)
+        existing_evidence.extend(evidences)
+        existing_dc_batches.append(dc_batch)
+        existing_dc_skipped.extend(skipped_logs)
+
+        event_by_id = {e.event_id: e for e in existing_events}
+        for ev_obj in evidences:
+            if ev_obj.event_id in event_by_id:
+                event = event_by_id[ev_obj.event_id]
+                if ev_obj.evidence_id not in event.evidence_ids:
+                    event.evidence_ids.append(ev_obj.evidence_id)
+
+        save_damage_claim_records(existing_records)
+        save_evidence(existing_evidence)
+        save_damage_claim_batches(existing_dc_batches)
+        save_damage_claim_skipped_logs(existing_dc_skipped)
+        save_events(existing_events)
+
+
+def get_damage_claims_for_event(event_id: str) -> list[DamageClaimRecord]:
+    all_records = load_damage_claim_records()
+    return [r for r in all_records if r.event_id == event_id]
+
+
+def get_damage_claim_skipped_logs_for_batch(damage_claim_batch_id: str) -> list[DamageClaimSkippedRowLog]:
+    all_logs = load_damage_claim_skipped_logs()
+    return [l for l in all_logs if l.damage_claim_batch_id == damage_claim_batch_id]
+
+
+def get_recent_damage_claims_for_box(box_id: str, limit: int = 10) -> list[DamageClaimRecord]:
+    all_records = load_damage_claim_records()
+    box_records = [r for r in all_records if r.box_id == box_id]
+    box_records.sort(key=lambda x: x.registration_time, reverse=True)
+    return box_records[:limit]
+
+
+class DamageClaimVersionConflictError(Exception):
+    def __init__(self, damage_claim_id: str, current_version: int, expected_version: int):
+        self.damage_claim_id = damage_claim_id
+        self.current_version = current_version
+        self.expected_version = expected_version
+        super().__init__(
+            f"破损记录 {damage_claim_id} 已被更新（当前版本: {current_version}, 期望版本: {expected_version}）"
+        )
+
+
+def update_damage_claim_remark(
+    damage_claim_id: str,
+    new_remark: str,
+    operator: str = "",
+    expected_version: int = None,
+) -> Tuple[bool, Optional[DamageClaimRecord]]:
+    with _lock:
+        records = load_damage_claim_records()
+        audit_logs = load_audit_logs()
+        target = None
+        for r in records:
+            if r.damage_claim_id == damage_claim_id:
+                target = r
+                break
+
+        if not target:
+            return False, None
+
+        if expected_version is not None and target.version != expected_version:
+            raise DamageClaimVersionConflictError(damage_claim_id, target.version, expected_version)
+
+        old_remark = target.remark
+        target.remark = new_remark
+        target.version += 1
+        target.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if old_remark != new_remark:
+            _append_audit_log(
+                audit_logs, target.event_id or damage_claim_id,
+                action=f"破损备注变更: {old_remark} -> {new_remark}",
+                operator=operator,
+                field_changed="damage_claim_remark",
+                old_value=old_remark,
+                new_value=new_remark,
+            )
+
+        save_damage_claim_records(records)
+        save_audit_logs(audit_logs)
+        return True, target
+
+
+def undo_last_damage_claim_import(operator: str = "system") -> Tuple[bool, int, str]:
+    with _lock:
+        dc_batches = load_damage_claim_batches()
+        if not dc_batches:
+            return False, 0, ""
+
+        last_batch = dc_batches[-1]
+
+        records = load_damage_claim_records()
+        to_remove = [r for r in records if r.damage_claim_batch_id == last_batch.damage_claim_batch_id]
+        pre_records = [r.to_dict() for r in to_remove]
+        remaining_records = [r for r in records if r.damage_claim_batch_id != last_batch.damage_claim_batch_id]
+
+        evidence_ids_to_remove = set()
+        for r in to_remove:
+            if r.event_id:
+                related_evidence = [
+                    e for e in load_evidence()
+                    if e.event_id == r.event_id
+                    and e.evidence_type == EvidenceType.DAMAGE_CLAIM.value
+                    and e.box_id == r.box_id
+                    and e.timestamp == r.registration_time
+                ]
+                evidence_ids_to_remove.update(e.evidence_id for e in related_evidence)
+
+        existing_evidence = load_evidence()
+        remaining_evidence = [e for e in existing_evidence if e.evidence_id not in evidence_ids_to_remove]
+
+        existing_events = load_events()
+        for ev in existing_events:
+            ev.evidence_ids = [eid for eid in ev.evidence_ids if eid not in evidence_ids_to_remove]
+
+        audit_logs = load_audit_logs()
+        for r in to_remove:
+            if r.event_id:
+                _append_audit_log(
+                    audit_logs, r.event_id,
+                    action="撤销破损导入",
+                    operator=operator,
+                    remark=f"撤销批次 {last_batch.damage_claim_batch_id} 的破损记录，箱号 {r.box_id}",
+                    field_changed="damage_claim_record",
+                    old_value=r.damage_claim_id,
+                    new_value="",
+                )
+
+        undo_record = DamageClaimUndoRecord(
+            damage_claim_batch_id=last_batch.damage_claim_batch_id,
+            operator=operator,
+            damage_claim_count=len(to_remove),
+            pre_damage_claims=pre_records,
+        )
+
+        existing_undo = load_damage_claim_undo_records()
+        existing_undo.append(undo_record)
+
+        dc_batches = dc_batches[:-1]
+        existing_dc_skipped = load_damage_claim_skipped_logs()
+        remaining_skipped = [l for l in existing_dc_skipped if l.damage_claim_batch_id != last_batch.damage_claim_batch_id]
+
+        save_damage_claim_records(remaining_records)
+        save_evidence(remaining_evidence)
+        save_events(existing_events)
+        save_audit_logs(audit_logs)
+        save_damage_claim_batches(dc_batches)
+        save_damage_claim_skipped_logs(remaining_skipped)
+        save_damage_claim_undo_records(existing_undo)
+
+        return True, len(to_remove), last_batch.damage_claim_batch_id
+
+
+def filter_damage_claim_records(
+    damage_claim_batch_id: str = "",
+    damage_level: str = "",
+    has_linked_event: Optional[bool] = None,
+) -> list[DamageClaimRecord]:
+    records = load_damage_claim_records()
+    if damage_claim_batch_id:
+        records = [r for r in records if r.damage_claim_batch_id == damage_claim_batch_id]
+    if damage_level:
+        records = [r for r in records if r.damage_level == damage_level]
+    if has_linked_event is not None:
+        events = load_events()
+        event_ids = {e.event_id for e in events}
+        if has_linked_event:
+            records = [r for r in records if r.event_id in event_ids]
+        else:
+            records = [r for r in records if r.event_id not in event_ids or not r.event_id]
+    return records
+
+
+def get_damage_claim_summary() -> Dict[str, Any]:
+    records = load_damage_claim_records()
+    events = load_events()
+    event_ids = {e.event_id for e in events}
+    linked = sum(1 for r in records if r.event_id in event_ids)
+    damage_level_counts: Dict[str, int] = {}
+    for r in records:
+        damage_level_counts[r.damage_level] = damage_level_counts.get(r.damage_level, 0) + 1
+    batches = load_damage_claim_batches()
+    skipped = load_damage_claim_skipped_logs()
+    undo_records = load_damage_claim_undo_records()
+    return {
+        "total_damage_claims": len(records),
+        "linked_to_events": linked,
+        "unlinked": len(records) - linked,
+        "damage_level_counts": damage_level_counts,
+        "total_batches": len(batches),
+        "total_skipped_rows": len(skipped),
+        "total_undo_records": len(undo_records),
+    }
+
+
 def clear_all_for_test():
     """Only for testing purposes."""
     with _lock:
@@ -1901,6 +2343,7 @@ def clear_all_for_test():
             _SKIPPED_FILE, _SNAPSHOTS_FILE, _DIFFS_FILE,
             _QC_INSPECTIONS_FILE, _QC_BATCHES_FILE, _QC_SKIPPED_FILE, _QC_UNDO_FILE,
             _HANDOVER_FILE, _HANDOVER_BATCHES_FILE, _HANDOVER_SKIPPED_FILE, _HANDOVER_UNDO_FILE,
+            _DAMAGE_CLAIM_FILE, _DAMAGE_CLAIM_BATCHES_FILE, _DAMAGE_CLAIM_SKIPPED_FILE, _DAMAGE_CLAIM_UNDO_FILE,
         ]:
             if os.path.exists(path):
                 os.remove(path)

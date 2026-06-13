@@ -30,6 +30,7 @@ from core.models import (
     Evidence,
     QCInspection, QCImportBatch, QCSkippedRowLog, QCUndoRecord, EvidenceType,
     HandoverRecord, HandoverImportBatch, HandoverSkippedRowLog, HandoverUndoRecord,
+    DamageClaimRecord, DamageClaimImportBatch, DamageClaimSkippedRowLog, DamageClaimUndoRecord,
 )
 from core.persistence import (
     add_events,
@@ -98,6 +99,21 @@ from core.persistence import (
     filter_handover_records,
     get_handover_summary,
     HandoverVersionConflictError,
+    import_damage_claim_csv,
+    save_damage_claim_import,
+    save_damage_claim_records,
+    load_damage_claim_records,
+    load_damage_claim_batches,
+    load_damage_claim_skipped_logs,
+    load_damage_claim_undo_records,
+    get_damage_claims_for_event,
+    get_damage_claim_skipped_logs_for_batch,
+    get_recent_damage_claims_for_box,
+    update_damage_claim_remark,
+    undo_last_damage_claim_import,
+    filter_damage_claim_records,
+    get_damage_claim_summary,
+    DamageClaimVersionConflictError,
 )
 
 
@@ -128,6 +144,14 @@ class TestBase(unittest.TestCase):
                 "temperature_lower_limit": -40.0,
                 "temperature_upper_limit": 10.0,
                 "match_window_minutes": 120,
+            },
+            "damage_claim": {
+                "required_columns": ["箱号", "登记时间", "破损类型", "破损等级", "照片编号", "登记人", "备注"],
+                "time_column": "登记时间",
+                "time_format": "%Y-%m-%d %H:%M:%S",
+                "damage_levels": ["轻微", "中度", "严重", "拒收"],
+                "acceptable_damage_types": ["外包装破损", "内包装破损", "封条破损", "箱体变形", "标签缺失", "渗漏", "虫害", "其他"],
+                "match_window_minutes": 180,
             },
         }
 
@@ -5081,6 +5105,746 @@ BX-999,2025-06-10 07:00:00,门岗B,-20.0,门岗李,无关联
                 event_id = row["event_id"]
                 json_ev = next(e for e in json_payload["events"] if e["event_id"] == event_id)
                 self.assertEqual(int(float(row["handover_count"])), json_ev["handover_count"])
+
+
+class TestDamageClaimImport(TestBase):
+    """Test damage claim CSV import validation: required columns, time format, duplicate detection, level/type enums."""
+
+    def _import_events_first(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+        return events
+
+    def test_import_happy_path_valid_records(self):
+        self._import_events_first()
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,箱子角部轻微凹陷
+BX-004,2025-06-10 11:10:00,渗漏,严重,P002,仓管B,明显渗漏痕迹
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="理赔员A"
+        )
+        self.assertEqual(len(records), 2)
+        self.assertEqual(len(skipped), 0)
+        self.assertEqual(dc_batch.valid_count, 2)
+        self.assertEqual(dc_batch.skipped_rows, 0)
+        self.assertEqual(dc_batch.status, "成功")
+
+        bx001_rec = [r for r in records if r.box_id == "BX-001"][0]
+        self.assertNotEqual(bx001_rec.event_id, "")
+        self.assertEqual(bx001_rec.damage_type, "外包装破损")
+        self.assertEqual(bx001_rec.damage_level, "中度")
+        self.assertEqual(bx001_rec.photo_number, "P001")
+        self.assertEqual(bx001_rec.registrar, "仓管A")
+        self.assertEqual(bx001_rec.remark, "箱子角部轻微凹陷")
+        self.assertEqual(bx001_rec.operator, "理赔员A")
+        self.assertEqual(bx001_rec.version, 1)
+
+        linked_evidence = [e for e in evidences if e.event_id == bx001_rec.event_id]
+        self.assertGreater(len(linked_evidence), 0)
+        self.assertEqual(linked_evidence[0].evidence_type, EvidenceType.DAMAGE_CLAIM.value)
+
+    def test_missing_required_column_raises(self):
+        bad_csv = """箱号,登记时间,破损类型
+BX-001,2025-06-10 08:15:00,外包装破损
+"""
+        with self.assertRaises(ValueError) as ctx:
+            import_damage_claim_csv(bad_csv.encode(), self.config)
+        self.assertIn("缺少必填列", str(ctx.exception))
+
+    def test_invalid_time_format_skipped(self):
+        self._import_events_first()
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,bad-time,外包装破损,中度,P001,仓管A,测试
+BX-004,2025-06-10 11:10:00,渗漏,严重,P002,仓管B,测试
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("时间格式错误", skipped[0].reason)
+        self.assertEqual(skipped[0].box_id, "BX-001")
+
+    def test_missing_fields_skipped(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,缺箱号
+BX-002,2025-06-10 09:05:00,,中度,P002,仓管B,缺破损类型
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        self.assertEqual(len(records), 0)
+        self.assertEqual(len(skipped), 2)
+        reasons = [s.reason for s in skipped]
+        self.assertTrue(any("缺箱号" in r for r in reasons))
+        self.assertTrue(any("缺破损类型" in r for r in reasons))
+
+    def test_invalid_damage_level_skipped(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,超级严重,P001,仓管A,等级错误
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        self.assertEqual(len(records), 0)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("破损等级无效", skipped[0].reason)
+
+    def test_invalid_damage_type_skipped(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外星人攻击,中度,P001,仓管A,类型错误
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        self.assertEqual(len(records), 0)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("破损类型不受理", skipped[0].reason)
+
+    def test_duplicate_same_box_same_photo_skipped(self):
+        self._import_events_first()
+        dc_csv1 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,第一批
+"""
+        records1, ev1, batch1, skipped1 = import_damage_claim_csv(
+            dc_csv1.encode(), self.config
+        )
+        save_damage_claim_import(records1, ev1, batch1, skipped1)
+
+        dc_csv2 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:20:00,内包装破损,严重,P001,仓管B,重复照片
+"""
+        records2, ev2, batch2, skipped2 = import_damage_claim_csv(
+            dc_csv2.encode(), self.config
+        )
+        self.assertEqual(len(records2), 0)
+        self.assertEqual(len(skipped2), 1)
+        self.assertIn("同箱同照片编号重复记录", skipped2[0].reason)
+
+    def test_damage_claim_without_matching_event(self):
+        self._import_events_first()
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-999,2025-06-10 08:15:00,外包装破损,中度,P999,仓管A,无匹配事件
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].event_id, "")
+        self.assertEqual(len(evidences), 0)
+
+    def test_skipped_logs_persisted(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,缺箱号
+BX-001,bad-time,外包装破损,中度,P002,仓管B,时间错
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+
+        saved_skipped = load_damage_claim_skipped_logs()
+        self.assertEqual(len(saved_skipped), 2)
+        for s in saved_skipped:
+            self.assertEqual(s.damage_claim_batch_id, dc_batch.damage_claim_batch_id)
+            self.assertIsNotNone(s.log_id)
+
+
+class TestDamageClaimRestartPersistence(TestBase):
+    """Test damage claim data survives restart (simulated by reload)."""
+
+    def _import_events_and_damage_claims(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc-restart")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc-restart", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc-restart", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,测试重启
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="理赔员A"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+        return events, records
+
+    def test_records_batches_skipped_undo_persist(self):
+        events, records_before = self._import_events_and_damage_claims()
+
+        rec_before = records_before[0]
+        self.assertNotEqual(rec_before.event_id, "")
+
+        reloaded_records = load_damage_claim_records()
+        self.assertEqual(len(reloaded_records), 1)
+        self.assertEqual(reloaded_records[0].box_id, "BX-001")
+        self.assertEqual(reloaded_records[0].registration_time, "2025-06-10 08:15:00")
+        self.assertEqual(reloaded_records[0].damage_type, "外包装破损")
+        self.assertEqual(reloaded_records[0].damage_level, "中度")
+        self.assertEqual(reloaded_records[0].photo_number, "P001")
+        self.assertEqual(reloaded_records[0].registrar, "仓管A")
+        self.assertEqual(reloaded_records[0].operator, "理赔员A")
+        self.assertEqual(reloaded_records[0].version, 1)
+
+        reloaded_batches = load_damage_claim_batches()
+        self.assertEqual(len(reloaded_batches), 1)
+        self.assertEqual(reloaded_batches[0].valid_count, 1)
+
+        reloaded_skipped = load_damage_claim_skipped_logs()
+        self.assertEqual(len(reloaded_skipped), 0)
+
+        reloaded_undo = load_damage_claim_undo_records()
+        self.assertEqual(len(reloaded_undo), 0)
+
+    def test_damage_claim_evidence_survives_restart(self):
+        events, records = self._import_events_and_damage_claims()
+        rec = records[0]
+
+        evidence_before = get_evidence_for_event(rec.event_id)
+        dc_evidence_before = [e for e in evidence_before if e.evidence_type == EvidenceType.DAMAGE_CLAIM.value]
+        self.assertGreater(len(dc_evidence_before), 0)
+
+        evidence_after = get_evidence_for_event(rec.event_id)
+        dc_evidence_after = [e for e in evidence_after if e.evidence_type == EvidenceType.DAMAGE_CLAIM.value]
+        self.assertEqual(len(dc_evidence_after), len(dc_evidence_before))
+        self.assertEqual(dc_evidence_after[0].detail, dc_evidence_before[0].detail)
+
+    def test_damage_claim_config_in_yaml(self):
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        self.assertIn("damage_claim", cfg)
+        self.assertIn("required_columns", cfg["damage_claim"])
+        self.assertIn("箱号", cfg["damage_claim"]["required_columns"])
+        self.assertIn("damage_levels", cfg["damage_claim"])
+        self.assertIn("acceptable_damage_types", cfg["damage_claim"])
+
+
+class TestDamageClaimVersionConflict(TestBase):
+    """Test damage claim remark version conflict detection."""
+
+    def test_update_remark_increments_version(self):
+        rec = DamageClaimRecord(box_id="BX-001", damage_type="外包装破损", damage_level="中度", photo_number="P001")
+        save_damage_claim_records([rec])
+
+        success, updated = update_damage_claim_remark(
+            rec.damage_claim_id,
+            new_remark="新的备注",
+            operator="理赔员A",
+        )
+        self.assertTrue(success)
+        self.assertEqual(updated.version, 2)
+        self.assertEqual(updated.remark, "新的备注")
+
+        reloaded = load_damage_claim_records()
+        self.assertEqual(reloaded[0].version, 2)
+
+    def test_version_conflict_raises(self):
+        rec = DamageClaimRecord(box_id="BX-001", damage_type="外包装破损", damage_level="中度", photo_number="P001", version=1)
+        save_damage_claim_records([rec])
+
+        update_damage_claim_remark(rec.damage_claim_id, new_remark="第一次修改", operator="理赔员A")
+
+        with self.assertRaises(DamageClaimVersionConflictError) as ctx:
+            update_damage_claim_remark(
+                rec.damage_claim_id,
+                new_remark="第二次修改",
+                operator="理赔员B",
+                expected_version=1,
+            )
+        self.assertEqual(ctx.exception.current_version, 2)
+        self.assertEqual(ctx.exception.expected_version, 1)
+
+    def test_no_conflict_when_version_matches(self):
+        rec = DamageClaimRecord(box_id="BX-001", damage_type="外包装破损", damage_level="中度", photo_number="P001", version=1)
+        save_damage_claim_records([rec])
+
+        success, updated = update_damage_claim_remark(
+            rec.damage_claim_id,
+            new_remark="匹配版本的修改",
+            operator="理赔员A",
+            expected_version=1,
+        )
+        self.assertTrue(success)
+        self.assertEqual(updated.version, 2)
+
+    def test_remark_change_writes_audit_log(self):
+        event = AnomalyEvent(box_id="BX-001")
+        save_events([event])
+        rec = DamageClaimRecord(box_id="BX-001", event_id=event.event_id, damage_type="外包装破损", damage_level="中度", photo_number="P001", remark="原始备注")
+        save_damage_claim_records([rec])
+
+        update_damage_claim_remark(
+            rec.damage_claim_id,
+            new_remark="新备注",
+            operator="修改人",
+        )
+
+        all_logs = load_audit_logs()
+        dc_logs = [l for l in all_logs if l.field_changed == "damage_claim_remark"]
+        self.assertGreater(len(dc_logs), 0)
+
+        log = dc_logs[-1]
+        self.assertIn("破损备注变更", log.action)
+        self.assertEqual(log.old_value, "原始备注")
+        self.assertEqual(log.new_value, "新备注")
+        self.assertEqual(log.operator, "修改人")
+
+    def test_no_change_no_audit_log(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 07:30:00,外包装破损,中度,P001,仓管A,相同备注
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="op"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+        target = records[0]
+
+        logs_before = len([l for l in load_audit_logs() if l.field_changed == "damage_claim_remark"])
+
+        update_damage_claim_remark(
+            target.damage_claim_id,
+            new_remark="相同备注",
+            operator="修改人",
+            expected_version=target.version,
+        )
+
+        logs_after = len([l for l in load_audit_logs() if l.field_changed == "damage_claim_remark"])
+        self.assertEqual(logs_before, logs_after)
+
+
+class TestDamageClaimUndoImport(TestBase):
+    """Test undoing the last damage claim import."""
+
+    def test_undo_removes_last_batch_records(self):
+        dc_csv1 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 07:30:00,外包装破损,中度,P001,仓管A,第一批
+"""
+        records1, evidences1, batch1, skipped1 = import_damage_claim_csv(
+            dc_csv1.encode(), self.config, operator="op1"
+        )
+        save_damage_claim_import(records1, evidences1, batch1, skipped1)
+
+        dc_csv2 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-002,2025-06-10 08:30:00,渗漏,严重,P002,仓管B,第二批
+"""
+        records2, evidences2, batch2, skipped2 = import_damage_claim_csv(
+            dc_csv2.encode(), self.config, operator="op2"
+        )
+        save_damage_claim_import(records2, evidences2, batch2, skipped2)
+
+        self.assertEqual(len(load_damage_claim_records()), 2)
+        self.assertEqual(len(load_damage_claim_batches()), 2)
+
+        success, count, batch_id = undo_last_damage_claim_import(operator="admin")
+        self.assertTrue(success)
+        self.assertEqual(count, 1)
+        self.assertEqual(batch_id, batch2.damage_claim_batch_id)
+
+        remaining = load_damage_claim_records()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].box_id, "BX-001")
+        self.assertEqual(remaining[0].damage_claim_batch_id, batch1.damage_claim_batch_id)
+
+        self.assertEqual(len(load_damage_claim_batches()), 1)
+        self.assertEqual(len(load_damage_claim_undo_records()), 1)
+
+    def test_undo_writes_audit_logs(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc-u")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc-u", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc-u", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,关联事件
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="op"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+
+        undo_last_damage_claim_import(operator="undoer")
+
+        all_logs = load_audit_logs()
+        undo_logs = [l for l in all_logs if "撤销破损导入" in l.action]
+        self.assertGreater(len(undo_logs), 0)
+        self.assertEqual(undo_logs[0].operator, "undoer")
+
+    def test_undo_nothing_when_no_batches(self):
+        success, count, batch_id = undo_last_damage_claim_import(operator="admin")
+        self.assertFalse(success)
+        self.assertEqual(count, 0)
+        self.assertEqual(batch_id, "")
+
+
+class TestDamageClaimFilter(TestBase):
+    """Test filtering damage claim records by batch, level, and linked event status."""
+
+    def _setup_test_data(self):
+        dc_csv1 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,中度破损
+BX-002,2025-06-10 09:05:00,渗漏,严重,P002,仓管B,严重破损
+"""
+        records1, ev1, batch1, skipped1 = import_damage_claim_csv(
+            dc_csv1.encode(), self.config, operator="op1"
+        )
+        save_damage_claim_import(records1, ev1, batch1, skipped1)
+
+        dc_csv2 = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-003,2025-06-10 10:00:00,箱体变形,轻微,P003,仓管C,轻微破损
+"""
+        records2, ev2, batch2, skipped2 = import_damage_claim_csv(
+            dc_csv2.encode(), self.config, operator="op2"
+        )
+        save_damage_claim_import(records2, ev2, batch2, skipped2)
+
+        return batch1, batch2
+
+    def test_filter_by_batch_id(self):
+        batch1, batch2 = self._setup_test_data()
+
+        filtered = filter_damage_claim_records(damage_claim_batch_id=batch1.damage_claim_batch_id)
+        self.assertEqual(len(filtered), 2)
+        for r in filtered:
+            self.assertEqual(r.damage_claim_batch_id, batch1.damage_claim_batch_id)
+
+        filtered2 = filter_damage_claim_records(damage_claim_batch_id=batch2.damage_claim_batch_id)
+        self.assertEqual(len(filtered2), 1)
+
+    def test_filter_by_damage_level(self):
+        self._setup_test_data()
+
+        filtered = filter_damage_claim_records(damage_level="严重")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].damage_level, "严重")
+        self.assertEqual(filtered[0].box_id, "BX-002")
+
+        filtered2 = filter_damage_claim_records(damage_level="中度")
+        self.assertEqual(len(filtered2), 1)
+
+    def test_filter_by_has_linked_event(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc-f")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc-f", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc-f", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,关联BX001
+BX-999,2025-06-10 07:00:00,箱体变形,轻微,P999,仓管Z,无关联
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="op"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+
+        linked = filter_damage_claim_records(has_linked_event=True)
+        unlinked = filter_damage_claim_records(has_linked_event=False)
+
+        self.assertGreater(len(linked), 0)
+        for r in linked:
+            self.assertTrue(r.event_id)
+
+        self.assertGreater(len(unlinked), 0)
+        for r in unlinked:
+            self.assertFalse(r.event_id)
+
+    def test_filter_combined_batch_and_level(self):
+        batch1, batch2 = self._setup_test_data()
+
+        filtered = filter_damage_claim_records(
+            damage_claim_batch_id=batch1.damage_claim_batch_id,
+            damage_level="中度"
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].box_id, "BX-001")
+
+    def test_get_damage_claim_summary_counts(self):
+        self._setup_test_data()
+
+        summary = get_damage_claim_summary()
+        self.assertEqual(summary["total_damage_claims"], 3)
+        self.assertEqual(summary["total_batches"], 2)
+        self.assertIn("damage_level_counts", summary)
+        self.assertEqual(summary["damage_level_counts"]["中度"], 1)
+        self.assertEqual(summary["damage_level_counts"]["严重"], 1)
+        self.assertEqual(summary["damage_level_counts"]["轻微"], 1)
+
+
+class TestDamageClaimDetailAssociation(TestBase):
+    """Test event detail page shows associated damage claim records."""
+
+    def _setup_events_with_damage_claims(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc-det")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc-det", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc-det", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,关联BX001
+BX-001,2025-06-10 08:20:00,渗漏,严重,P002,仓管B,另一条
+BX-004,2025-06-10 11:10:00,箱体变形,轻微,P003,仓管C,关联BX004
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="理赔员A"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+        return events
+
+    def test_event_detail_shows_linked_damage_claims(self):
+        events = self._setup_events_with_damage_claims()
+
+        target_event = events[0]
+        linked = get_damage_claims_for_event(target_event.event_id)
+        self.assertGreater(len(linked), 0)
+
+        for rec in linked:
+            self.assertEqual(rec.event_id, target_event.event_id)
+            self.assertIsNotNone(rec.damage_claim_id)
+            self.assertIsNotNone(rec.damage_type)
+
+    def test_get_recent_damage_claims_for_box(self):
+        self._setup_events_with_damage_claims()
+
+        recent = get_recent_damage_claims_for_box("BX-001", limit=5)
+        self.assertGreater(len(recent), 0)
+        self.assertLessEqual(len(recent), 5)
+
+        for rec in recent:
+            self.assertEqual(rec.box_id, "BX-001")
+
+        recent_limited = get_recent_damage_claims_for_box("BX-001", limit=1)
+        self.assertEqual(len(recent_limited), 1)
+
+
+class TestDamageClaimExportFields(TestBase):
+    """Test CSV and JSON exports include damage claim data."""
+
+    def _setup_events_with_damage_claims(self):
+        df = parse_temperature_csv(self.temp_csv_content.encode())
+        valid_rows, skipped_logs = validate_temperature_rows(df, self.config, batch_id="batch-dc-exp")
+        raw_data_hash = compute_raw_data_hash(valid_rows)
+        config_sig = compute_config_hash(self.config)
+        events, temp_evidence = generate_events(
+            valid_rows, self.config, "batch-dc-exp", "temp.csv",
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+        )
+        batch = ImportBatch(
+            batch_id="batch-dc-exp", file_name="temp.csv",
+            file_hash=compute_file_hash(self.temp_csv_content.encode()),
+            raw_data_hash=raw_data_hash, config_signature=config_sig,
+            row_count=len(df), skipped_rows=len(skipped_logs), status="成功",
+        )
+        add_events(events, temp_evidence, batch, skipped_logs)
+
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,中度,P001,仓管A,关联BX001
+BX-999,2025-06-10 07:00:00,箱体变形,轻微,P999,仓管Z,无关联
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config, operator="理赔员A"
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+
+        target = records[0]
+        update_damage_claim_remark(
+            target.damage_claim_id,
+            new_remark="修改过的备注",
+            operator="编辑者",
+            expected_version=target.version,
+        )
+
+        return events
+
+    def test_csv_export_includes_damage_claim_rows(self):
+        self._setup_events_with_damage_claims()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        dc_rows = df[df["row_type"] == "包装破损"]
+        self.assertGreater(len(dc_rows), 0)
+
+        required_cols = [
+            "damage_claim_id", "damage_claim_batch_id", "registration_time",
+            "damage_type", "damage_level", "photo_number",
+            "registrar", "damage_claim_remark", "dc_operator", "dc_version",
+        ]
+        for col in required_cols:
+            self.assertIn(col, df.columns, f"CSV missing damage claim column: {col}")
+
+    def test_csv_export_includes_damage_claim_summary(self):
+        self._setup_events_with_damage_claims()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        summary_rows = df[df["row_type"] == "理赔摘要"]
+        self.assertGreater(len(summary_rows), 0)
+
+        summary = summary_rows.iloc[0]
+        self.assertIn("dc_total_damage_claims", df.columns)
+        self.assertIn("dc_linked_to_events", df.columns)
+
+    def test_csv_export_includes_damage_claim_skipped_rows(self):
+        dc_csv = """箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+,2025-06-10 07:30:00,外包装破损,中度,P001,仓管A,缺箱号被跳过
+"""
+        records, evidences, dc_batch, skipped = import_damage_claim_csv(
+            dc_csv.encode(), self.config
+        )
+        save_damage_claim_import(records, evidences, dc_batch, skipped)
+
+        from app import build_csv_export
+        events = load_events()
+        csv_content = build_csv_export(events)
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        skipped_rows = df[df["row_type"] == "理赔跳过行"]
+        self.assertGreater(len(skipped_rows), 0)
+        self.assertIn("skip_reason", df.columns)
+        self.assertIn("registration_time_raw", df.columns)
+
+    def test_csv_export_includes_damage_claim_undo_records(self):
+        self._setup_events_with_damage_claims()
+        undo_last_damage_claim_import(operator="admin")
+
+        from app import build_csv_export
+        events = load_events()
+        csv_content = build_csv_export(events)
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        undo_rows = df[df["row_type"] == "理赔撤销记录"]
+        self.assertGreater(len(undo_rows), 0)
+        self.assertIn("dc_undo_id", df.columns)
+        self.assertIn("dc_undo_operator", df.columns)
+
+    def test_csv_event_row_has_damage_claim_fields(self):
+        self._setup_events_with_damage_claims()
+        from app import build_csv_export
+
+        csv_content = build_csv_export(load_events())
+        df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+
+        event_rows = df[df["row_type"] == "事件"]
+        self.assertIn("damage_claim_count", event_rows.columns)
+        self.assertIn("damage_claim_summary", event_rows.columns)
+        self.assertIn("damage_claim_remark_conflict", event_rows.columns)
+        self.assertIn("damage_claim_audit_logs", event_rows.columns)
+
+        with_dc = event_rows[event_rows["damage_claim_count"].astype(float).astype(int) > 0]
+        self.assertGreater(len(with_dc), 0)
+
+    def test_json_export_includes_damage_claim_fields(self):
+        self._setup_events_with_damage_claims()
+        from app import build_json_export
+
+        payload = build_json_export(load_events())
+
+        self.assertIn("damage_claim_summary", payload)
+        self.assertIn("damage_claim_records", payload)
+        self.assertIn("damage_claim_skipped_rows", payload)
+        self.assertIn("damage_claim_undo_records", payload)
+        self.assertIn("damage_claim_import_batches", payload)
+
+        self.assertGreater(len(payload["damage_claim_records"]), 0)
+        self.assertGreater(payload["damage_claim_summary"]["total_damage_claims"], 0)
+
+        for ev in payload["events"]:
+            self.assertIn("damage_claim_count", ev)
+            self.assertIn("damage_claims", ev)
+            self.assertIn("damage_claim_remark_conflict", ev)
+            self.assertIn("damage_claim_conflict_logs", ev)
+
+        event_with_dc = [ev for ev in payload["events"] if ev["damage_claim_count"] > 0]
+        self.assertGreater(len(event_with_dc), 0)
+        for ev in event_with_dc:
+            self.assertGreater(len(ev["damage_claims"]), 0)
+            dc = ev["damage_claims"][0]
+            self.assertIn("damage_claim_id", dc)
+            self.assertIn("box_id", dc)
+            self.assertIn("damage_type", dc)
+            self.assertIn("damage_level", dc)
+            self.assertIn("photo_number", dc)
+
+    def test_json_and_csv_damage_claim_consistent(self):
+        self._setup_events_with_damage_claims()
+        from app import build_csv_export, build_json_export
+
+        filtered = load_events()
+        csv_content = build_csv_export(filtered)
+        json_payload = build_json_export(filtered)
+
+        csv_df = pd.read_csv(io.StringIO(csv_content), keep_default_na=False)
+        csv_dc_rows = csv_df[csv_df["row_type"] == "包装破损"]
+        json_dc = json_payload["damage_claim_records"]
+
+        self.assertEqual(len(csv_dc_rows), len(json_dc))
+
+        csv_event = csv_df[csv_df["row_type"] == "事件"]
+        for _, row in csv_event.iterrows():
+            if int(float(row.get("damage_claim_count", 0))) > 0:
+                event_id = row["event_id"]
+                json_ev = next(e for e in json_payload["events"] if e["event_id"] == event_id)
+                self.assertEqual(int(float(row["damage_claim_count"])), json_ev["damage_claim_count"])
 
 
 if __name__ == "__main__":

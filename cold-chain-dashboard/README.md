@@ -449,3 +449,225 @@ handover_check:
 | `handover_undo_records.json` | `HandoverUndoRecord` | `undo_id`；关联 `handover_batch_id` |
 
 以上文件全部在 `store/` 目录下，应用重启时自动从 JSON 恢复（读取 → 迁移默认值 → 内存对象）。
+
+---
+
+## 包装破损理赔初筛模块
+
+### 功能概述
+
+通过仓库拍照登记后的破损 CSV 记录，自动初筛哪些温控异常需要走理赔流程，帮助复核人员快速定位。
+
+- 左侧导航新增「**包装破损理赔**」菜单（三个 Tab：导入破损 / 破损记录 / 撤销导入）
+- 异常事件看板和事件复核页的「事件详情」新增「关联包装破损记录」和「同箱最近包装破损记录」
+- 导入规则可通过 `config.yaml > damage_claim` 灵活配置
+- 备注修改具备乐观锁版本冲突检测，所有变更写审计日志
+- 所有记录（破损记录、批次、跳过行、撤销记录、审计日志）持久化到 `store/*.json`，**应用重启后自动恢复**
+- CSV / JSON 导出补全理赔摘要、破损记录、跳过行、撤销记录、备注冲突日志
+
+---
+
+### 破损 CSV 样例
+
+```csv
+箱号,登记时间,破损类型,破损等级,照片编号,登记人,备注
+BX-001,2025-06-10 08:15:00,外包装破损,严重,PHT-20250610-001,仓管员A,箱体一角明显压坏
+BX-001,2025-06-10 08:16:00,内包装破损,中度,PHT-20250610-002,仓管员A,内盒有轻微变形
+BX-002,2025-06-10 09:20:00,封条破损,轻微,PHT-20250610-003,仓管员B,封条有撬动痕迹
+BX-003,2025-06-10 10:05:00,箱体变形,中度,PHT-20250610-004,仓管员B,箱体轻微凹陷
+BX-004,2025-06-10 11:10:00,渗漏,严重,PHT-20250610-005,仓管员A,箱底有液体渗出
+BX-004,2025-06-10 11:12:00,标签缺失,轻微,PHT-20250610-006,仓管员A,温度标签脱落
+```
+
+---
+
+### 字段含义
+
+| 列名（中文） | 字段名（代码） | 类型 | 必填 | 说明 |
+|--------------|----------------|------|------|------|
+| **箱号** | `box_id` | string | ✅ | 箱子唯一编号，用于关联异常事件 |
+| **登记时间** | `registration_time` | string | ✅ | 格式 `YYYY-MM-DD HH:MM:SS`（可配置），破损拍照登记时间 |
+| **破损类型** | `damage_type` | string | ✅ | 破损类型，必须在 `acceptable_damage_types` 枚举范围内 |
+| **破损等级** | `damage_level` | string | ✅ | 破损等级，必须在 `damage_levels` 枚举范围内 |
+| **照片编号** | `photo_number` | string | ✅ | 照片唯一编号，用于去重（同箱同照片编号视为重复） |
+| **登记人** | `registrar` | string | ✅ | 执行拍照登记的人员姓名/工号 |
+| **备注** | `remark` | string | ✅ | 自由文本备注，支持后续人工修改 |
+
+---
+
+### config.yaml 导入规则配置
+
+```yaml
+damage_claim:
+  # 必填列（缺失时导入报错）
+  required_columns:
+    - 箱号
+    - 登记时间
+    - 破损类型
+    - 破损等级
+    - 照片编号
+    - 登记人
+    - 备注
+
+  # 时间列和格式
+  time_column: 登记时间
+  time_format: "%Y-%m-%d %H:%M:%S"
+
+  # 破损等级枚举（不在列表中的行被跳过）
+  damage_levels:
+    - 轻微
+    - 中度
+    - 严重
+    - 拒收
+
+  # 可受理破损类型（不在列表中的行被跳过）
+  acceptable_damage_types:
+    - 外包装破损
+    - 内包装破损
+    - 封条破损
+    - 箱体变形
+    - 标签缺失
+    - 渗漏
+    - 虫害
+    - 其他
+
+  # 与异常事件匹配的时间窗口（分钟）
+  # 登记时间落在 [事件开始 - window, 事件结束 + window] 区间内自动关联
+  match_window_minutes: 180
+```
+
+---
+
+### 校验规则与跳过行
+
+导入时**逐行校验**，不满足的行写入 `store/damage_claim_skipped_rows.json`，每条跳过行都带明确原因：
+
+| 跳过原因 | 触发条件 |
+|----------|----------|
+| `缺箱号` | 箱号为空 |
+| `缺登记时间` | 登记时间为空 |
+| `缺破损类型` | 破损类型为空 |
+| `缺破损等级` | 破损等级为空 |
+| `缺照片编号` | 照片编号为空 |
+| `缺登记人` | 登记人为空 |
+| `时间格式错误: {raw}，期望: {format}` | 登记时间无法按 `time_format` 解析 |
+| `破损等级无效: {raw}，允许值: [...]` | 破损等级不在 `damage_levels` 枚举内 |
+| `破损类型不受理: {raw}，允许类型: [...]` | 破损类型不在 `acceptable_damage_types` 枚举内 |
+| `同箱同照片编号重复记录: 箱号={bid}, 照片编号={p}` | 同一 (箱号, 照片编号) 组合已存在（跨批次去重） |
+
+---
+
+### 页面功能
+
+#### 📥 Tab1：导入破损
+- **CSV 上传** + 操作人填写
+- 点击「开始导入破损数据」后：
+  - 校验缺列 → 缺必填列直接报错并终止
+  - 逐行校验 → 跳过行带原因落盘
+  - 去重 → 同箱同照片编号的重复记录被跳过
+  - 事件关联 → 登记时间在异常事件 ±match_window 内的自动关联
+  - 关联成功的写入证据（`EvidenceType.DAMAGE_CLAIM`）和审计日志
+- 导入结果展示：有效记录数 / 关联事件数 / 证据数 / 跳过行数，支持展开查看跳过行
+
+#### 📊 Tab2：破损记录
+- **顶部指标**：总破损记录、关联事件数、未关联数、导入批次数
+- **三维筛选**（支持组合）：
+  - 按**导入批次**筛选
+  - 按**破损等级**筛选
+  - 按**是否命中现有异常**筛选（全部 / 已关联异常 / 未关联异常）
+- **列表展示**：箱号、登记时间、破损类型、破损等级、照片编号、登记人、备注、关联事件、上传人、版本等
+- **备注编辑**：输入破损 ID → 加载当前值和版本 → 修改 → 提交
+  - 提交时带 `expected_version` 做乐观锁校验
+  - 若版本冲突 → 弹出 `DamageClaimVersionConflictError`，提示当前版本和期望版本
+  - 成功后 `version += 1`，写入审计日志（`field_changed = "damage_claim_remark"`）
+
+#### ↩️ Tab3：撤销导入
+- 可撤销**最近一次**破损导入批次（删除对应破损记录、破损证据、跳过行、批次记录）
+- 写入「撤销破损导入」审计日志
+- 展示完整「撤销历史」（撤销ID、批次ID、时间、操作人、移除记录数）
+
+#### 📋 异常事件详情 - 新增破损区块
+在「关联交接记录」之后新增：
+1. **关联包装破损记录**（bullet 列表）：直接关联到该事件的破损记录
+2. **同箱最近包装破损记录**（表格 DataFrame）：按时间倒序的最近 10 条同箱破损，含类型、等级、照片编号、关联状态
+
+---
+
+### 导出字段补全（CSV / JSON）
+
+#### CSV 新增行类型
+
+| row_type | 说明 | 有效列 |
+|----------|------|--------|
+| `包装破损` | 每条破损 = 1 行（关联事件的跟着事件走，未关联的在末尾） | `damage_claim_id, damage_claim_batch_id, registration_time, damage_type, damage_level, photo_number, registrar, damage_claim_remark, dc_operator, dc_version, dc_last_updated_at` |
+| `理赔摘要` | 全局统计汇总 = 1 行 | `dc_total_damage_claims, dc_linked_to_events, dc_unlinked, dc_damage_level_counts, dc_total_batches, dc_total_skipped_rows, dc_total_undo_records` |
+| `理赔跳过行` | 每条跳过记录 = 1 行 | `damage_claim_batch_id, row_number, box_id, registration_time_raw, damage_type_raw, damage_level_raw, photo_number_raw, skip_reason` |
+| `理赔撤销记录` | 每次撤销 = 1 行 | `dc_undo_id, damage_claim_batch_id, dc_undone_at, dc_undo_operator, damage_claim_count` |
+
+#### CSV 事件行新增破损字段
+
+| 新增列 | 类型 | 含义 |
+|--------|------|------|
+| `damage_claim_count` | int | 关联到此事件的破损记录数量 |
+| `damage_claim_summary` | string | 摘要字符串：`{箱号}@{时间}: 类型={t}, 等级={l}, 照片={p}, 登记人={name}; ...` |
+| `damage_claim_remark_conflict` | bool | 是否存在破损备注变更（用于检测冲突） |
+| `damage_claim_audit_logs` | string | 破损备注变更的审计日志摘要：`{时间}: {旧值} -> {新值} (by {操作人}); ...` |
+
+#### JSON 新增顶层键
+
+```jsonc
+{
+  "events": [
+    {
+      // ...原有事件字段...
+      "damage_claim_count": 2,
+      "damage_claims": [ /* 关联的 DamageClaimRecord 数组 */ ],
+      "damage_claim_remark_conflict": true,
+      "damage_claim_conflict_logs": [ /* 破损备注变更的审计日志数组 */ ]
+    }
+  ],
+  // ...原有导出字段...
+  "damage_claim_summary": {
+    "total_damage_claims": 50,
+    "linked_to_events": 32,
+    "unlinked": 18,
+    "damage_level_counts": {"轻微": 20, "中度": 15, "严重": 10, "拒收": 5},
+    "total_batches": 3,
+    "total_skipped_rows": 5,
+    "total_undo_records": 1
+  },
+  "damage_claim_records":       [ /* 全部 DamageClaimRecord */ ],
+  "damage_claim_skipped_rows":  [ /* 全部 DamageClaimSkippedRowLog */ ],
+  "damage_claim_undo_records": [ /* 全部 DamageClaimUndoRecord */ ],
+  "damage_claim_import_batches":[ /* 全部 DamageClaimImportBatch */ ]
+}
+```
+
+---
+
+### 验证方法（自测 / 联调）
+
+1. **CSV 格式验证**：用 `data/sample_damage_claims.csv` 导入，观察跳过行
+2. **缺列测试**：删掉「破损类型」列重导入，预期报错「缺少必填列」
+3. **等级无效测试**：改破损等级为 `unknown-level`，预期跳过并带「破损等级无效」原因
+4. **类型不受理测试**：改破损类型为 `虚构类型`，预期跳过并带「破损类型不受理」原因
+5. **重复记录测试**：相同箱号+照片编号导入两次，第二次预期跳过
+6. **关联测试**：温度 CSV 生成异常事件 → 导入破损 CSV（登记时间在事件窗口内）→ 查看事件详情确认关联
+7. **冲突测试**：打开两个浏览器会话改同一条备注 → 第二个提交预期触发 `DamageClaimVersionConflictError`
+8. **重启恢复测试**：导入后关掉 streamlit 再启动 → 破损记录、跳过行、撤销记录、审计日志仍然存在
+9. **导出验证**：CSV 用 Excel 打开确认 UTF-8-BOM 中文正常；JSON 检查 `damage_claim_summary`、`damage_claim_records`、事件内 `damage_claims` 都非空
+10. **筛选测试**：在「破损记录」Tab 按批次、破损等级、是否关联异常分别筛选，确认列表正确过滤
+11. **撤销测试**：导入一批后撤销 → 确认记录清空、撤销历史增加一条
+
+---
+
+### 数据模型一览（persistence store）
+
+| store 文件 | 模型类 | 主键 / 索引 |
+|------------|--------|-------------|
+| `damage_claim_records.json` | `DamageClaimRecord` | `damage_claim_id`（12位 hex）；去重键 `(box_id, photo_number)` |
+| `damage_claim_import_batches.json` | `DamageClaimImportBatch` | `damage_claim_batch_id` |
+| `damage_claim_skipped_rows.json` | `DamageClaimSkippedRowLog` | `log_id`；关联 `damage_claim_batch_id` |
+| `damage_claim_undo_records.json` | `DamageClaimUndoRecord` | `undo_id`；关联 `damage_claim_batch_id` |
+
+以上文件全部在 `store/` 目录下，应用重启时自动从 JSON 恢复（读取 → 迁移默认值 → 内存对象）。

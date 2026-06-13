@@ -25,6 +25,7 @@ class EvidenceType(str, Enum):
     CARRIER_ALERT = "承运商告警"
     QC_INSPECTION = "到货质检"
     HANDOVER = "交接记录"
+    DAMAGE_CLAIM = "包装破损"
 
 
 class ChangeType(str, Enum):
@@ -320,6 +321,74 @@ class HandoverUndoRecord:
     operator: str = ""
     handover_count: int = 0
     pre_handovers: list = field(default_factory=list)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class DamageClaimRecord:
+    damage_claim_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    box_id: str = ""
+    registration_time: str = ""
+    damage_type: str = ""
+    damage_level: str = ""
+    photo_number: str = ""
+    registrar: str = ""
+    remark: str = ""
+    event_id: str = ""
+    damage_claim_batch_id: str = ""
+    operator: str = ""
+    version: int = 1
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    last_updated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class DamageClaimImportBatch:
+    damage_claim_batch_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    import_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    file_name: str = ""
+    file_hash: str = ""
+    row_count: int = 0
+    valid_count: int = 0
+    skipped_rows: int = 0
+    status: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class DamageClaimSkippedRowLog:
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    damage_claim_batch_id: str = ""
+    row_number: int = 0
+    reason: str = ""
+    box_id: str = ""
+    registration_time_raw: str = ""
+    damage_type_raw: str = ""
+    damage_level_raw: str = ""
+    photo_number_raw: str = ""
+    registrar_raw: str = ""
+    remark_raw: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class DamageClaimUndoRecord:
+    undo_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    damage_claim_batch_id: str = ""
+    undone_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    operator: str = ""
+    damage_claim_count: int = 0
+    pre_damage_claims: list = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)

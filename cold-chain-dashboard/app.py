@@ -79,6 +79,20 @@ from core.persistence import (
     filter_handover_records,
     get_handover_summary,
     HandoverVersionConflictError,
+    import_damage_claim_csv,
+    save_damage_claim_import,
+    load_damage_claim_records,
+    load_damage_claim_batches,
+    load_damage_claim_skipped_logs,
+    load_damage_claim_undo_records,
+    get_damage_claims_for_event,
+    get_damage_claim_skipped_logs_for_batch,
+    get_recent_damage_claims_for_box,
+    update_damage_claim_remark,
+    undo_last_damage_claim_import,
+    filter_damage_claim_records,
+    get_damage_claim_summary,
+    DamageClaimVersionConflictError,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -98,7 +112,7 @@ def save_config(cfg):
 st.set_page_config(page_title="冷链到货温控复盘看板", layout="wide")
 st.title("🧊 冷链到货温控复盘看板")
 
-menu = st.sidebar.radio("导航", ["数据导入", "到货质检抽检", "交接温差核对", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
+menu = st.sidebar.radio("导航", ["数据导入", "到货质检抽检", "交接温差核对", "包装破损理赔", "异常事件看板", "事件复核", "重分析追踪", "导出", "阈值配置", "导入历史"])
 
 cfg = load_config()
 
@@ -169,6 +183,17 @@ def build_csv_export(events: list) -> str:
         if log.field_changed == "handover_remark":
             ho_audit_by_event.setdefault(log.event_id, []).append(log)
 
+    all_damage_claims = load_damage_claim_records()
+    dc_by_event: Dict[str, list] = {}
+    for dc in all_damage_claims:
+        if dc.event_id:
+            dc_by_event.setdefault(dc.event_id, []).append(dc)
+
+    dc_audit_by_event: Dict[str, list] = {}
+    for log in all_audit_logs:
+        if log.field_changed == "damage_claim_remark":
+            dc_audit_by_event.setdefault(log.event_id, []).append(log)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
@@ -193,6 +218,18 @@ def build_csv_export(events: list) -> str:
             for log in ho_audit_logs
         ])
 
+        event_dc = dc_by_event.get(e.event_id, [])
+        dc_summary_str = "; ".join([
+            f"{dc.box_id}@{dc.registration_time}: 类型={dc.damage_type}, 等级={dc.damage_level}, 照片={dc.photo_number}, 登记人={dc.registrar}"
+            for dc in event_dc
+        ])
+        dc_audit_logs = dc_audit_by_event.get(e.event_id, [])
+        dc_conflict = len(dc_audit_logs) > 0
+        dc_audit_str = "; ".join([
+            f"{log.timestamp}: {log.old_value} -> {log.new_value} (by {log.operator})"
+            for log in dc_audit_logs
+        ])
+
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
@@ -211,6 +248,10 @@ def build_csv_export(events: list) -> str:
         event_dict["handover_summary"] = ho_summary_str
         event_dict["handover_remark_conflict"] = ho_conflict
         event_dict["handover_audit_logs"] = ho_audit_str
+        event_dict["damage_claim_count"] = len(event_dc)
+        event_dict["damage_claim_summary"] = dc_summary_str
+        event_dict["damage_claim_remark_conflict"] = dc_conflict
+        event_dict["damage_claim_audit_logs"] = dc_audit_str
         csv_rows.append(event_dict)
 
         for log in get_audit_logs_for_event(e.event_id):
@@ -259,6 +300,24 @@ def build_csv_export(events: list) -> str:
                 "ho_operator": h.operator,
                 "ho_version": h.version,
                 "ho_last_updated_at": h.last_updated_at,
+            })
+
+        for dc in event_dc:
+            csv_rows.append({
+                "row_type": "包装破损",
+                "event_id": e.event_id,
+                "box_id": dc.box_id,
+                "damage_claim_id": dc.damage_claim_id,
+                "damage_claim_batch_id": dc.damage_claim_batch_id,
+                "registration_time": dc.registration_time,
+                "damage_type": dc.damage_type,
+                "damage_level": dc.damage_level,
+                "photo_number": dc.photo_number,
+                "registrar": dc.registrar,
+                "damage_claim_remark": dc.remark,
+                "dc_operator": dc.operator,
+                "dc_version": dc.version,
+                "dc_last_updated_at": dc.last_updated_at,
             })
 
         for d in event_diffs:
@@ -389,6 +448,64 @@ def build_csv_export(events: list) -> str:
             "handover_count": ur.handover_count,
         })
 
+    dc_summary = get_damage_claim_summary()
+    if dc_summary and dc_summary["total_damage_claims"] > 0:
+        csv_rows.append({
+            "row_type": "理赔摘要",
+            "dc_total_damage_claims": dc_summary["total_damage_claims"],
+            "dc_linked_to_events": dc_summary["linked_to_events"],
+            "dc_unlinked": dc_summary["unlinked"],
+            "dc_damage_level_counts": json.dumps(dc_summary["damage_level_counts"], ensure_ascii=False),
+            "dc_total_batches": dc_summary["total_batches"],
+            "dc_total_skipped_rows": dc_summary["total_skipped_rows"],
+            "dc_total_undo_records": dc_summary["total_undo_records"],
+        })
+
+    event_ids_set = set(e.event_id for e in events)
+    unlinked_dc = [dc for dc in all_damage_claims if not dc.event_id or dc.event_id not in event_ids_set]
+    for dc in unlinked_dc:
+        csv_rows.append({
+            "row_type": "包装破损",
+            "event_id": dc.event_id or "",
+            "box_id": dc.box_id,
+            "damage_claim_id": dc.damage_claim_id,
+            "damage_claim_batch_id": dc.damage_claim_batch_id,
+            "registration_time": dc.registration_time,
+            "damage_type": dc.damage_type,
+            "damage_level": dc.damage_level,
+            "photo_number": dc.photo_number,
+            "registrar": dc.registrar,
+            "damage_claim_remark": dc.remark,
+            "dc_operator": dc.operator,
+            "dc_version": dc.version,
+            "dc_last_updated_at": dc.last_updated_at,
+        })
+
+    all_dc_skipped = load_damage_claim_skipped_logs()
+    for sl in all_dc_skipped:
+        csv_rows.append({
+            "row_type": "理赔跳过行",
+            "damage_claim_batch_id": sl.damage_claim_batch_id,
+            "row_number": sl.row_number,
+            "box_id": sl.box_id,
+            "registration_time_raw": sl.registration_time_raw,
+            "damage_type_raw": sl.damage_type_raw,
+            "damage_level_raw": sl.damage_level_raw,
+            "photo_number_raw": sl.photo_number_raw,
+            "skip_reason": sl.reason,
+        })
+
+    all_dc_undo = load_damage_claim_undo_records()
+    for ur in all_dc_undo:
+        csv_rows.append({
+            "row_type": "理赔撤销记录",
+            "dc_undo_id": ur.undo_id,
+            "damage_claim_batch_id": ur.damage_claim_batch_id,
+            "dc_undone_at": ur.undone_at,
+            "dc_undo_operator": ur.operator,
+            "damage_claim_count": ur.damage_claim_count,
+        })
+
     df = pd.DataFrame(csv_rows)
     column_order = [
         "row_type", "event_id", "box_id",
@@ -411,6 +528,10 @@ def build_csv_export(events: list) -> str:
         "handover_id", "handover_batch_id", "handover_time", "handover_point",
         "handover_temperature", "handover_person", "handover_remark",
         "ho_operator", "ho_version", "ho_last_updated_at",
+        "damage_claim_count", "damage_claim_summary", "damage_claim_remark_conflict", "damage_claim_audit_logs",
+        "damage_claim_id", "damage_claim_batch_id", "registration_time", "damage_type",
+        "damage_level", "photo_number", "registrar", "damage_claim_remark",
+        "dc_operator", "dc_version", "dc_last_updated_at",
         "diff_id", "snapshot_id", "change_type",
         "alert_count_old", "alert_count_new",
         "field_changes", "evidence_changes", "diff_timestamp",
@@ -420,9 +541,13 @@ def build_csv_export(events: list) -> str:
         "qc_appearance_result_counts", "qc_total_skipped_rows", "qc_total_undo_records",
         "ho_total_handovers", "ho_linked_to_events", "ho_unlinked",
         "ho_handover_point_counts", "ho_total_batches", "ho_total_skipped_rows", "ho_total_undo_records",
-        "row_number", "inspection_time_raw", "handover_time_raw", "handover_point_raw", "skip_reason",
+        "dc_total_damage_claims", "dc_linked_to_events", "dc_unlinked",
+        "dc_damage_level_counts", "dc_total_batches", "dc_total_skipped_rows", "dc_total_undo_records",
+        "row_number", "inspection_time_raw", "handover_time_raw", "handover_point_raw",
+        "registration_time_raw", "damage_type_raw", "damage_level_raw", "photo_number_raw", "skip_reason",
         "undo_id", "undone_at", "undo_operator", "inspection_count",
         "ho_undo_id", "ho_undone_at", "ho_undo_operator", "handover_count",
+        "dc_undo_id", "dc_undone_at", "dc_undo_operator", "damage_claim_count",
     ]
     available_cols = [c for c in column_order if c in df.columns]
     df = df[available_cols]
@@ -465,6 +590,17 @@ def build_json_export(events: list) -> dict:
         if log.field_changed == "handover_remark":
             ho_audit_by_event.setdefault(log.event_id, []).append(log)
 
+    all_damage_claims = load_damage_claim_records()
+    dc_by_event: Dict[str, list] = {}
+    for dc in all_damage_claims:
+        if dc.event_id:
+            dc_by_event.setdefault(dc.event_id, []).append(dc)
+
+    dc_audit_by_event: Dict[str, list] = {}
+    for log in all_audit_logs_all:
+        if log.field_changed == "damage_claim_remark":
+            dc_audit_by_event.setdefault(log.event_id, []).append(log)
+
     for e in events:
         event_diffs = diff_by_event.get(e.event_id, [])
         has_conflict = any(d.has_conflict for d in event_diffs)
@@ -481,6 +617,15 @@ def build_json_export(events: list) -> dict:
             log_dict["log_timestamp"] = log_dict.pop("timestamp")
             ho_conflict_logs.append(log_dict)
 
+        event_dc = dc_by_event.get(e.event_id, [])
+        dc_audit_logs = dc_audit_by_event.get(e.event_id, [])
+        dc_conflict = len(dc_audit_logs) > 0
+        dc_conflict_logs = []
+        for log in dc_audit_logs:
+            log_dict = log.to_dict()
+            log_dict["log_timestamp"] = log_dict.pop("timestamp")
+            dc_conflict_logs.append(log_dict)
+
         event_dict = e.to_dict()
         event_dict["is_overdue"] = _is_overdue(e.deadline)
         event_dict["overdue_status"] = "已逾期" if _is_overdue(e.deadline) else "正常"
@@ -496,6 +641,10 @@ def build_json_export(events: list) -> dict:
         event_dict["handovers"] = [h.to_dict() for h in event_ho]
         event_dict["handover_remark_conflict"] = ho_conflict
         event_dict["handover_conflict_logs"] = ho_conflict_logs
+        event_dict["damage_claim_count"] = len(event_dc)
+        event_dict["damage_claims"] = [dc.to_dict() for dc in event_dc]
+        event_dict["damage_claim_remark_conflict"] = dc_conflict
+        event_dict["damage_claim_conflict_logs"] = dc_conflict_logs
         export_events.append(event_dict)
 
     evidence_data = []
@@ -527,6 +676,11 @@ def build_json_export(events: list) -> dict:
     ho_undo_records = [ur.to_dict() for ur in load_handover_undo_records()]
     ho_batches = [b.to_dict() for b in load_handover_batches()]
 
+    dc_summary = get_damage_claim_summary()
+    dc_skipped_logs = [sl.to_dict() for sl in load_damage_claim_skipped_logs()]
+    dc_undo_records = [ur.to_dict() for ur in load_damage_claim_undo_records()]
+    dc_batches = [b.to_dict() for b in load_damage_claim_batches()]
+
     return {
         "events": export_events,
         "evidence": evidence_data,
@@ -544,6 +698,11 @@ def build_json_export(events: list) -> dict:
         "handover_skipped_rows": ho_skipped_logs,
         "handover_undo_records": ho_undo_records,
         "handover_import_batches": ho_batches,
+        "damage_claim_summary": dc_summary,
+        "damage_claim_records": [dc.to_dict() for dc in all_damage_claims],
+        "damage_claim_skipped_rows": dc_skipped_logs,
+        "damage_claim_undo_records": dc_undo_records,
+        "damage_claim_import_batches": dc_batches,
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1114,6 +1273,227 @@ elif menu == "交接温差核对":
             st.dataframe(pd.DataFrame(ho_undo_rows), use_container_width=True, hide_index=True)
 
 
+elif menu == "包装破损理赔":
+    st.header("📦 包装破损理赔")
+    st.markdown("上传仓库拍照登记后的破损 CSV，系统自动筛选可理赔的温控异常并关联事件。")
+
+    tab_import, tab_list, tab_undo = st.tabs(["📥 导入破损", "📊 破损记录", "↩️ 撤销导入"])
+
+    with tab_import:
+        dc_file = st.file_uploader("破损 CSV", type=["csv"], key="damage_claim_csv")
+        dc_operator = st.text_input("上传人/操作人", key="dc_operator")
+
+        with st.expander("CSV 格式要求"):
+            st.markdown("""
+            必填列: 箱号、登记时间、破损类型、破损等级、照片编号、登记人、备注
+
+            登记时间格式: YYYY-MM-DD HH:MM:SS
+
+            破损等级允许值: 轻微、中度、严重、拒收
+
+            可受理破损类型: 外包装破损、内包装破损、封条破损、箱体变形、标签缺失、渗漏、虫害、其他
+
+            同箱号+同照片编号的重复记录将被跳过。
+            """)
+
+        if st.button("开始导入破损数据", type="primary", key="import_damage_claim"):
+            if not dc_file:
+                st.error("请上传破损 CSV 文件")
+            else:
+                try:
+                    content = dc_file.read()
+                    records, evidences, dc_batch, skipped_logs = import_damage_claim_csv(
+                        content, cfg, operator=dc_operator.strip() or "system"
+                    )
+
+                    dc_batch.file_name = dc_file.name
+                    save_damage_claim_import(records, evidences, dc_batch, skipped_logs)
+
+                    linked = sum(1 for r in records if r.event_id)
+                    st.success(
+                        f"✅ 导入完成: {len(records)} 条破损记录, "
+                        f"{linked} 条关联到异常事件, "
+                        f"{len(evidences)} 条破损证据, "
+                        f"跳过 {len(skipped_logs)} 行"
+                    )
+
+                    if skipped_logs:
+                        with st.expander(f"⚠️ 查看 {len(skipped_logs)} 条跳过行", expanded=False):
+                            skip_df = pd.DataFrame([
+                                {
+                                    "行号": l.row_number,
+                                    "箱号": l.box_id,
+                                    "登记时间": l.registration_time_raw,
+                                    "破损类型": l.damage_type_raw,
+                                    "破损等级": l.damage_level_raw,
+                                    "照片编号": l.photo_number_raw,
+                                    "跳过原因": l.reason,
+                                }
+                                for l in skipped_logs
+                            ])
+                            st.dataframe(skip_df, use_container_width=True, hide_index=True)
+
+                except ValueError as e:
+                    st.error(f"❌ 导入失败: {e}")
+                except Exception as e:
+                    st.error(f"❌ 导入失败: {e}")
+
+    with tab_list:
+        all_dc_records = load_damage_claim_records()
+        all_dc_batches = load_damage_claim_batches()
+
+        if not all_dc_records:
+            st.info("暂无破损记录")
+        else:
+            dc_summary = get_damage_claim_summary()
+            col_dc1, col_dc2, col_dc3, col_dc4 = st.columns(4)
+            col_dc1.metric("总破损记录", dc_summary["total_damage_claims"])
+            col_dc2.metric("关联事件数", dc_summary["linked_to_events"])
+            col_dc3.metric("未关联数", dc_summary["unlinked"])
+            col_dc4.metric("导入批次", dc_summary["total_batches"])
+
+            st.markdown("---")
+
+            col_dcf1, col_dcf2, col_dcf3 = st.columns(3)
+            with col_dcf1:
+                dc_batch_options = ["全部"] + [b.damage_claim_batch_id for b in all_dc_batches]
+                selected_dc_batch = st.selectbox("按导入批次筛选", dc_batch_options, index=0, key="dc_batch_filter")
+            with col_dcf2:
+                dc_level_options = ["全部"] + sorted(set(r.damage_level for r in all_dc_records if r.damage_level))
+                selected_dc_level = st.selectbox("按破损等级筛选", dc_level_options, index=0, key="dc_level_filter")
+            with col_dcf3:
+                dc_link_filter = st.selectbox(
+                    "按是否关联异常筛选",
+                    ["全部", "已关联异常", "未关联异常"],
+                    index=0,
+                    key="dc_link_filter",
+                )
+
+            filtered_dc = filter_damage_claim_records(
+                damage_claim_batch_id="" if selected_dc_batch == "全部" else selected_dc_batch,
+                damage_level="" if selected_dc_level == "全部" else selected_dc_level,
+                has_linked_event=True if dc_link_filter == "已关联异常" else (False if dc_link_filter == "未关联异常" else None),
+            )
+
+            if not filtered_dc:
+                st.info("无匹配记录")
+            else:
+                st.markdown(f"**共 {len(filtered_dc)} 条破损记录**")
+                dc_rows = []
+                for r in filtered_dc:
+                    dc_event_info = ""
+                    if r.event_id:
+                        ev = get_event_by_id(r.event_id)
+                        if ev:
+                            dc_event_info = f"{ev.event_id} ({ev.box_id})"
+                    dc_rows.append({
+                        "箱号": r.box_id,
+                        "登记时间": r.registration_time,
+                        "破损类型": r.damage_type,
+                        "破损等级": r.damage_level,
+                        "照片编号": r.photo_number,
+                        "登记人": r.registrar,
+                        "备注": r.remark,
+                        "关联事件": dc_event_info,
+                        "上传人": r.operator,
+                        "版本": r.version,
+                        "最后更新": r.last_updated_at,
+                        "破损ID": r.damage_claim_id,
+                    })
+                dc_df = pd.DataFrame(dc_rows)
+                st.dataframe(dc_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            selected_dc_id = st.text_input("输入破损ID修改备注", key="selected_dc_id")
+            if selected_dc_id:
+                all_dc_list = load_damage_claim_records()
+                target_dc = next((r for r in all_dc_list if r.damage_claim_id == selected_dc_id), None)
+                if target_dc:
+                    st.markdown(
+                        f"**箱号:** {target_dc.box_id} | "
+                        f"**登记时间:** {target_dc.registration_time} | "
+                        f"**破损类型:** {target_dc.damage_type} | "
+                        f"**破损等级:** {target_dc.damage_level} | "
+                        f"**当前版本:** {target_dc.version}"
+                    )
+                    new_dc_remark = st.text_area(
+                        "新备注", value=target_dc.remark, key="edit_dc_remark"
+                    )
+                    edit_dc_operator = st.text_input("操作人", key="edit_dc_operator")
+
+                    if "current_dc_version" not in st.session_state or st.session_state.get("current_dc_id") != target_dc.damage_claim_id:
+                        st.session_state.current_dc_id = target_dc.damage_claim_id
+                        st.session_state.current_dc_version = target_dc.version
+
+                    if target_dc.version != st.session_state.current_dc_version:
+                        st.warning(
+                            f"⚠️ 该破损记录已被其他用户更新！当前版本: {target_dc.version}, "
+                            f"您加载的版本: {st.session_state.current_dc_version}。"
+                            "请刷新页面查看最新数据后再操作。"
+                        )
+                        st.session_state.current_dc_version = target_dc.version
+
+                    if st.button("提交备注修改", type="primary", key="submit_dc_edit"):
+                        if not edit_dc_operator.strip():
+                            st.error("请填写操作人")
+                        else:
+                            try:
+                                success, updated_dc = update_damage_claim_remark(
+                                    selected_dc_id,
+                                    new_remark=new_dc_remark,
+                                    operator=edit_dc_operator.strip(),
+                                    expected_version=st.session_state.current_dc_version,
+                                )
+                                if success:
+                                    st.success(f"破损记录 {selected_dc_id} 已更新，版本: {updated_dc.version}")
+                                    st.session_state.current_dc_version = updated_dc.version
+                                    st.rerun()
+                            except DamageClaimVersionConflictError as e:
+                                st.error(f"❌ {str(e)}")
+                                st.session_state.current_dc_version = e.current_version
+                else:
+                    st.warning("未找到该破损记录")
+
+    with tab_undo:
+        dc_batches = load_damage_claim_batches()
+        dc_undo_records = load_damage_claim_undo_records()
+
+        if not dc_batches:
+            st.info("暂无导入记录可撤销")
+        else:
+            last_dc_batch = dc_batches[-1]
+            st.warning(
+                f"⚠️ 将撤销最近一次破损导入（批次: {last_dc_batch.damage_claim_batch_id}，"
+                f"时间: {last_dc_batch.import_time}，有效记录: {last_dc_batch.valid_count}条）。"
+                f"此操作不可逆。"
+            )
+            dc_undo_operator = st.text_input("操作人", value="admin", key="dc_undo_operator")
+            if st.button("撤销最近一次破损导入", type="primary", key="undo_damage_claim"):
+                if not dc_undo_operator.strip():
+                    st.error("请填写操作人")
+                else:
+                    success, count, dc_batch_id = undo_last_damage_claim_import(operator=dc_undo_operator.strip())
+                    if success:
+                        st.success(f"✅ 撤销成功！已移除 {count} 条破损记录（批次: {dc_batch_id}）")
+                        st.rerun()
+                    else:
+                        st.error("❌ 撤销失败")
+
+        if dc_undo_records:
+            st.markdown("---")
+            st.subheader("撤销历史")
+            dc_undo_rows = []
+            for r in dc_undo_records:
+                dc_undo_rows.append({
+                    "撤销ID": r.undo_id,
+                    "批次ID": r.damage_claim_batch_id,
+                    "撤销时间": r.undone_at,
+                    "操作人": r.operator,
+                    "移除记录数": r.damage_claim_count,
+                })
+            st.dataframe(pd.DataFrame(dc_undo_rows), use_container_width=True, hide_index=True)
+
+
 elif menu == "异常事件看板":
     st.header("异常事件看板")
     events = load_events()
@@ -1244,6 +1624,34 @@ elif menu == "异常事件看板":
                             "关联状态": linked_info,
                         })
                     st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
+
+                dc_records = get_damage_claims_for_event(ev.event_id)
+                if dc_records:
+                    st.markdown("**关联包装破损记录:**")
+                    for dc in dc_records:
+                        st.markdown(
+                            f"- 📦 箱号: {dc.box_id} | 登记时间: {dc.registration_time} | "
+                            f"破损类型: {dc.damage_type} | 等级: {dc.damage_level} | "
+                            f"照片编号: {dc.photo_number} | 登记人: {dc.registrar} | "
+                            f"备注: {dc.remark} | 版本: {dc.version}"
+                        )
+
+                recent_dc = get_recent_damage_claims_for_box(ev.box_id, limit=10)
+                if recent_dc:
+                    st.markdown("**同箱最近包装破损记录:**")
+                    recent_dc_rows = []
+                    for rdc in recent_dc:
+                        linked_info = "已关联" if rdc.event_id else "未关联"
+                        recent_dc_rows.append({
+                            "登记时间": rdc.registration_time,
+                            "破损类型": rdc.damage_type,
+                            "破损等级": rdc.damage_level,
+                            "照片编号": rdc.photo_number,
+                            "登记人": rdc.registrar,
+                            "备注": rdc.remark,
+                            "关联状态": linked_info,
+                        })
+                    st.dataframe(pd.DataFrame(recent_dc_rows), use_container_width=True, hide_index=True)
 
                 log_list = get_audit_logs_for_event(ev.event_id)
                 if log_list:
